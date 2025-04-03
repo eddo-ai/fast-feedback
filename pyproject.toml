@@ -1,0 +1,23 @@
+[project]
+name = "fast"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "streamlit>=1.40.1",
+    "langchain>=0.3.7",
+    "langchain-openai>=0.2.8",
+    "langchain-community>=0.3.7",
+    "python-docx>=1.1.2",
+    "markdown>=3.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "watchdog>=6.0.0",
+]
