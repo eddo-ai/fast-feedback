@@ -288,11 +288,23 @@ def build_filter_widgets(
         # Teacher filter
         if teacher_col:
             teachers: list[str] = ["All"] + sorted(df[teacher_col].unique().tolist())
+            # Determine the index for the teacher selectbox based on session state
+            teacher_index = 0  # Default to "All"
+            selected_teacher = st.session_state.get("selected_teacher", "All")
+            if selected_teacher in teachers:
+                try:
+                    teacher_index = teachers.index(selected_teacher)
+                except ValueError:
+                    logger.warning(
+                        f"Saved teacher '{selected_teacher}' not found in options. Defaulting to 'All'."
+                    )
+                    teacher_index = 0  # Fallback to "All" if saved teacher not in list
+
             st.selectbox(
                 "Teacher:",
                 teachers,
                 key="selected_teacher",
-                index=0,
+                index=teacher_index,  # Use calculated index
             )
 
         # Hour filter
@@ -378,7 +390,7 @@ def get_google_sheet():
         assert email in ALLOWED_EMAILS, "You are not authorized to access this tool."
     except Exception as e:
         logger.error(f"Error getting user email: {e}")
-        st.error(  
+        st.error(
             "You are not authorized to access this tool. Contact aw@eddolearning.com for access."
         )
         logger.error(
@@ -894,6 +906,7 @@ st.title("🦎 Green Anole Assessment Review with AI Assist")
 # --- Session State Initialization ---
 if "initial_load_complete" not in st.session_state:
     st.session_state.initial_load_complete = False
+    st.session_state.initial_teacher_set = False  # Flag for initial teacher setting
 if "selected_response" not in st.session_state:
     st.session_state.selected_response = None  # Initialize if not present
 if "confirm_rerun" not in st.session_state:
@@ -1084,6 +1097,43 @@ if df_raw is not None:
             "Could not automatically detect required 'Email' or 'Student Name' columns. Please check the Google Sheet column headers and the `COLUMN_PATTERNS` dictionary in the script."
         )
         st.stop()  # Stop execution if essential columns are missing
+
+    # --- Set Initial Teacher Filter (Only Once Per Session) ---
+    if (
+        not st.session_state.get("initial_teacher_set", False)
+        and teacher_col in df_raw.columns
+    ):
+        try:
+            user_email = st.experimental_user.email
+            if "EMAIL_TO_TEACHER" in st.secrets:
+                email_to_teacher = st.secrets["EMAIL_TO_TEACHER"]
+                default_teacher = email_to_teacher.get(
+                    user_email
+                )  # Returns None if not found
+                if default_teacher and default_teacher in df_raw[teacher_col].unique():
+                    st.session_state.selected_teacher = default_teacher
+                    logger.info(
+                        f"Setting initial teacher filter to '{default_teacher}' for user '{user_email}'."
+                    )
+                else:
+                    if default_teacher:
+                        logger.warning(
+                            f"Teacher '{default_teacher}' mapped to user '{user_email}' not found in sheet. Defaulting to 'All'."
+                        )
+                    st.session_state.selected_teacher = (
+                        "All"  # Default if not found or not in sheet
+                    )
+            else:
+                logger.warning(
+                    "'EMAIL_TO_TEACHER' not found in secrets. Defaulting teacher filter to 'All'."
+                )
+                st.session_state.selected_teacher = "All"  # Default if secrets missing
+
+            st.session_state.initial_teacher_set = True  # Mark as set
+        except Exception as e:
+            logger.error(f"Error setting initial teacher filter: {e}")
+            st.session_state.selected_teacher = "All"  # Default on any error
+            st.session_state.initial_teacher_set = True  # Prevent retrying on error
 
     if df_raw.empty:
         logger.warning("No responses found!")
