@@ -242,6 +242,7 @@ dependencies = [
     { name = "langchain-openai" },
     { name = "markdown" },
     { name = "python-docx" },
+    { name = "rich" },
     { name = "streamlit" },
 ]
 
@@ -258,6 +259,7 @@ requires-dist = [
     { name = "langchain-openai", specifier = ">=0.2.8" },
     { name = "markdown", specifier = ">=3.7" },
     { name = "python-docx", specifier = ">=1.1.2" },
+    { name = "rich", specifier = ">=13.9.4" },
     { name = "streamlit", specifier = ">=1.40.1" },
 ]
 

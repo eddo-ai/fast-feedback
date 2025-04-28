@@ -47,8 +47,18 @@ COLUMN_PATTERNS = {
 }
 
 
+@st.cache_data(ttl=900)  # 15-minute cache
+def load_gsheet_df() -> pd.DataFrame:
+    """Load and preprocess Google Sheet data with column detection.
+    Returns every 15 minutes for each user session."""
+    df = get_google_sheet()
+    if df is not None:
+        return detect_and_rename(df)
+    return pd.DataFrame()  # Return empty DataFrame if load fails
+
+
 def generate_response_options(
-    df: pd.DataFrame, email_col: str, name_col: str
+    df: pd.DataFrame, email_col: str, name_col: str, key_suffix: str = ""
 ) -> list[str]:
     """Generate a list of response options with status indicators.
 
@@ -56,6 +66,7 @@ def generate_response_options(
         df (pd.DataFrame): DataFrame containing response data
         email_col (str): Name of the email column
         name_col (str): Name of the student name column
+        key_suffix (str): Optional suffix to make checkbox key unique
 
     Returns:
         list[str]: List of formatted response options with status indicators
@@ -68,22 +79,63 @@ def generate_response_options(
             logger.debug(f"Available columns: {df.columns.tolist()}")
         return []
 
-    options = []
-    for _, row in df.sort_values(by=[name_col, email_col]).iterrows():
+    # Initialize or get the alias mapping
+    if "alias_mapping" not in st.session_state:
+        st.session_state.alias_mapping = {}
+
+    # Get show_names value from session state
+    show_names = st.session_state.get("show_names", False)
+    logger.debug(f"Generating options with show_names={show_names}")
+
+    # Sort DataFrame based on show_names setting
+    if show_names:
+        df_sorted = df.sort_values(by=[name_col, email_col])
+    else:
+        df_sorted = df.sort_values(by=[email_col])
+
+    # Create aliases using DataFrame index (or use a stable ID if available)
+    # Let's stick with index for alias generation for now
+    for idx, row in df_sorted.iterrows():
+        email = row[email_col]
+        if email not in st.session_state.alias_mapping:
+            # Use the original DataFrame's index for a potentially more stable ID
+            # Requires passing the original df or finding the row there.
+            # Simpler: Use the index from the *sorted* df for display ID.
+            st.session_state.alias_mapping[email] = f"Response #{idx+1}"
+
+    email_options = []
+    display_mapping = {}
+
+    for idx, row in df_sorted.iterrows():
         email = row[email_col]
         name = row.get(name_col, "Unknown Name")
 
-        # Determine status indicator
-        if row.get("finalized", False):
-            status = "🟢"  # Finalized
-        elif isinstance(row.get("ai_evaluation"), dict) and row.get("ai_evaluation"):
-            status = "🟡"  # In progress
+        # Determine status indicator based on new criteria
+        is_teacher_reviewed = pd.notna(row.get("teacher_score")) or (
+            row.get("teacher_notes") and str(row.get("teacher_notes")).strip()
+        )
+        has_ai_evaluation = isinstance(row.get("ai_evaluation"), dict) and row.get(
+            "ai_evaluation"
+        )
+
+        if is_teacher_reviewed:
+            status = "🟢"  # Done (Teacher scored or noted)
+        elif has_ai_evaluation:
+            status = "🟡"  # In progress (AI eval done, but no teacher input)
         else:
             status = "⚪️"  # Not started
 
-        options.append(f"{status} {name} (`{email}`)")
+        # Generate display text based on show_names
+        response_display_id = f"#{idx+1}"  # Use sorted index for display ID
+        if show_names:
+            display_text = f"{status} {response_display_id} {name} (`{email}`)"
+        else:
+            display_text = f"{status} Response {response_display_id}"
 
-    return options
+        email_options.append(email)
+        display_mapping[email] = display_text
+
+    return email_options, display_mapping
 
 
 def detect_and_rename(df: pd.DataFrame) -> pd.DataFrame:
@@ -200,6 +252,119 @@ except Exception as e:
     3. The prompt URL (hey-aw/openscied-rubric-b6-green-anole)
     """
     )
+
+
+# --- Helper Function for Column Detection ---
+def find_column(df_columns, potential_names):
+    """Find the first matching column name from a list of potential names."""
+    for name in potential_names:
+        if name in df_columns:
+            logger.info(f"Detected column: '{name}'")
+            return name
+    logger.warning(f"Could not find any of the potential columns: {potential_names}")
+    return None
+
+
+def get_current_time() -> str:
+    """Get current time in ISO format."""
+    return datetime.now().isoformat()
+
+
+def build_filter_widgets(
+    df: pd.DataFrame, teacher_col: str | None, hour_col: str | None
+) -> None:
+    """Build all sidebar filter widgets outside of fragments.
+
+    Args:
+        df: The DataFrame containing response data
+        teacher_col: Name of the teacher column, if it exists
+        hour_col: Name of the hour column, if it exists
+    """
+    with st.sidebar:
+        st.header("🔍 Select Responses")
+
+        # Teacher filter
+        if teacher_col:
+            teachers: list[str] = ["All"] + sorted(df[teacher_col].unique().tolist())
+            st.selectbox(
+                "Teacher:",
+                teachers,
+                key="selected_teacher",
+                index=0,
+            )
+
+        # Hour filter
+        if hour_col:
+            hours: list[str] = ["All"] + sorted(df[hour_col].unique().tolist())
+            st.selectbox(
+                "Hour:",
+                hours,
+                key="selected_hour",
+                index=0,
+            )
+
+        # Status filter
+        status_options: list[str] = ["All", "Not Started", "In Progress", "Finalized"]
+        st.selectbox(
+            "Review Status:",
+            status_options,
+            key="selected_status",
+            index=0,
+        )
+
+        # Add metrics section
+        st.divider()
+
+
+def apply_filters(
+    df: pd.DataFrame, teacher_col: str | None, hour_col: str | None
+) -> pd.DataFrame:
+    """Apply filters to the DataFrame based on session state values."""
+    filtered_df = df.copy()
+
+    # Get filter values from session state
+    selected_teacher = st.session_state.get("selected_teacher", "All")
+    selected_hour = st.session_state.get("selected_hour", "All")
+    selected_status = st.session_state.get("selected_status", "All")
+
+    # Apply teacher filter
+    if selected_teacher != "All" and teacher_col and teacher_col in filtered_df.columns:
+        filtered_df = filtered_df[filtered_df[teacher_col] == selected_teacher]
+
+    # Apply hour filter
+    if selected_hour != "All" and hour_col and hour_col in filtered_df.columns:
+        filtered_df = filtered_df[filtered_df[hour_col] == selected_hour]
+
+    # Apply status filter
+    if selected_status != "All":
+        if selected_status == "Not Started":
+            # Ensure necessary columns exist before filtering
+            if (
+                "ai_evaluation" in filtered_df.columns
+                and "finalized" in filtered_df.columns
+            ):
+                filtered_df = filtered_df[
+                    filtered_df["ai_evaluation"].apply(
+                        lambda x: not isinstance(x, dict) or not x
+                    )
+                    & (~filtered_df["finalized"].fillna(False))
+                ]
+        elif selected_status == "In Progress":
+            if (
+                "ai_evaluation" in filtered_df.columns
+                and "finalized" in filtered_df.columns
+            ):
+                filtered_df = filtered_df[
+                    filtered_df["ai_evaluation"].apply(
+                        lambda x: isinstance(x, dict) and bool(x)
+                    )
+                    & (~filtered_df["finalized"].fillna(False))
+                ]
+        elif selected_status == "Finalized":
+            if "finalized" in filtered_df.columns:
+                filtered_df = filtered_df[filtered_df["finalized"].fillna(False)]
+
+    return filtered_df
 
 
 def get_google_sheet():
@@ -604,83 +769,110 @@ def batch_evaluate(df, llm, evaluation_prompt, email_col, batch_size=5):
             return df
 
         unevaluated_df = df.loc[unevaluated_indices]
-        logger.info(f"Found {len(unevaluated_df)} responses for batch evaluation.")
+        total_to_evaluate = len(unevaluated_df)
+        logger.info(f"Found {total_to_evaluate} responses for batch evaluation.")
+
+        # Create a progress bar
+        progress_bar = st.progress(0)
+        status_container = st.empty()
+        results_container = st.empty()
+        results_text = []
 
         evaluation_count = 0
+        success_count = 0
+        error_count = 0
+
         # Process in batches
         for start in range(0, len(unevaluated_df), batch_size):
             batch = unevaluated_df.iloc[start : start + batch_size]
 
             for idx, row in batch.iterrows():
                 try:
-                    email = row[email_col]  # Use detected email column
-                    logger.debug(f"Evaluating response for {email}")
+                    email = row[email_col]
+                    name = row.get("name", "Unknown")  # Get student name if available
+                    status_container.write(
+                        f"🔄 Evaluating response from {name} ({email})"
+                    )
+
                     # Run evaluation
                     evaluation = run_evaluation(
                         llm,
                         evaluation_prompt,
-                        row[PART1_COL],  # Use named column
-                        row[PART2_COL],  # Use named column
+                        row[PART1_COL],
+                        row[PART2_COL],
                     )
 
                     if evaluation:
                         # Save results using the database function
                         save_success = save_enriched_data(
                             email=email,
-                            ai_output=evaluation,  # Pass the dict directly
-                            teacher_notes=row.get(
-                                "teacher_notes", ""
-                            ),  # Preserve existing notes
-                            teacher_score=row.get(
-                                "teacher_score", None
-                            ),  # Preserve teacher_score
-                            finalized=row.get(
-                                "finalized", False
-                            ),  # Preserve finalized status
+                            ai_output=evaluation,
+                            teacher_notes=row.get("teacher_notes", ""),
+                            teacher_score=row.get("teacher_score", None),
+                            finalized=row.get("finalized", False),
                         )
                         if save_success:
-                            logger.info(f"Successfully saved evaluation for {email}")
-                            # Update the DataFrame in memory immediately using the unique email
+                            success_count += 1
+                            overall_score = evaluation.get("rubric_scores", {}).get(
+                                "Overall", "N/A"
+                            )
+                            results_text.append(
+                                f"✅ {name} ({email}): Score {overall_score}/4"
+                            )
+                            # Update the DataFrame in memory
                             df.loc[df[email_col] == email, "ai_evaluation"] = [
                                 evaluation
-                            ]  # Use detected email_col  # Use list for assignment with boolean index
+                            ]
                             df.loc[df[email_col] == email, "last_modified"] = (
                                 datetime.now()
-                            )  # Use detected email_col
-                            evaluation_count += 1
+                            )
                         else:
-                            logger.error(f"Failed to save evaluation for {email}")
+                            error_count += 1
+                            results_text.append(
+                                f"❌ {name} ({email}): Failed to save evaluation"
+                            )
+                    else:
+                        error_count += 1
+                        results_text.append(
+                            f"❌ {name} ({email}): No evaluation results"
+                        )
 
                 except Exception as e:
-                    # Log error for the specific row and continue
-                    logger.error(
-                        f"Error evaluating or saving response for {row.get(email_col, 'UNKNOWN')}: {e}"  # Use detected email_col
-                    )
-                    continue
+                    error_count += 1
+                    results_text.append(f"❌ {name} ({email}): Error - {str(e)}")
+                    logger.error(f"Error evaluating response for {email}: {e}")
+
+                evaluation_count += 1
+                # Update progress
+                progress = evaluation_count / total_to_evaluate
+                progress_bar.progress(progress)
+                # Show running results, keeping last 10 visible
+                results_container.markdown(
+                    "**Recent Results:**\n" + "\n".join(results_text[-10:])
+                )
+
+        # Final status update
+        status_container.write(
+            f"✨ Batch evaluation complete! "
+            f"Processed {evaluation_count} responses: "
+            f"{success_count} successful, {error_count} errors"
+        )
+        # Show all results in an expander
+        with st.expander("View All Results"):
+            st.markdown("\n".join(results_text))
 
         logger.info(
             f"Batch evaluation complete. Evaluated {evaluation_count} responses."
         )
-        return df  # Return the updated DataFrame
+        return df
 
     except Exception as e:
         logger.error(f"Batch evaluation failed: {e}")
-        return df  # Return original DataFrame on outer error
-
-
-# --- Helper Function for Column Detection ---
-def find_column(df_columns, potential_names):
-    """Find the first matching column name from a list of potential names."""
-    for name in potential_names:
-        if name in df_columns:
-            logger.info(f"Detected column: '{name}'")
-            return name
-    logger.warning(f"Could not find any of the potential columns: {potential_names}")
-    return None
+        return df
 
 
 # --- Streamlit App ---
-st.title("✨🦔 AI Response Evaluator")
+st.title("🦎 Green Anole Assessment Review with AI Assist")
 
 # --- Session State Initialization ---
 if "initial_load_complete" not in st.session_state:
@@ -694,11 +886,16 @@ if "confirm_rerun" not in st.session_state:
 # --- Callback Functions ---
 def set_selection_state(target=None):
     """Callback to update selection state. Gets value directly from session state."""
-    logger.debug(
-        f"Callback set_selection_state called with value from selectbox: {st.session_state.response_selector}"
-    )
+    logger.debug(f"Callback set_selection_state called with target: {target}")
     if target is not None:
         st.session_state.response_selector = target
+    elif "response_selector" not in st.session_state:
+        # Initialize with first option if available
+        if "response_options" in st.session_state and st.session_state.response_options:
+            st.session_state.response_selector = st.session_state.response_options[0]
+        else:
+            st.session_state.response_selector = None
+
     st.session_state.selected_response = st.session_state.response_selector
     # Reset confirmation state on any navigation/selection change
     st.session_state.confirm_rerun = False
@@ -716,37 +913,109 @@ def save_and_finalize(email, ai_eval_data, notes, score):
     )
     if save_success:
         st.success("🎉 Marked as complete!")
-        st.rerun()  # Force a rerun immediately after successful save
         return True  # Indicate success
     else:
         st.error("Failed to save finalization.")
         return False  # Indicate failure
 
 
-def clear_teacher_evaluation():
-    """Callback to clear teacher score and notes."""
-    # Get current email from selected response
-    if st.session_state.selected_response:
+def clear_teacher_evaluation(email: str):
+    """Callback to clear teacher score and notes while preserving AI evaluation.
+
+    Args:
+        email (str): The email identifier for the response to clear.
+    """
+    if not email:
+        logger.error("Clear teacher evaluation called without a valid email.")
+        st.error("Could not identify the response to clear.")
+        return
+
+    logger.info(f"Attempting to clear teacher evaluation for {email}")
+    # Get the current AI evaluation before clearing
+    db = SessionLocal()
+    current_ai_eval = None
+    save_success = False
+    try:
+        existing_record = (
+            db.query(EnrichedData).filter(EnrichedData.Timestamp == email).first()
+        )
+        current_ai_eval = existing_record.ai_evaluation if existing_record else None
+    except Exception as e:
+        logger.error(f"Error fetching existing data for {email} before clear: {e}")
+        st.error("Failed to load existing data before clearing.")
+        db.close()
+        return  # Stop if we can't fetch existing data
+    finally:
+        db.close()  # Ensure db is closed even on fetch error
+
+    # Save the cleared state to database while preserving AI evaluation
+    save_success = save_enriched_data(
+        email=email,
+        ai_output=current_ai_eval,  # Preserve existing AI evaluation
+        teacher_notes="",  # Clear notes
+        teacher_score=None,  # Clear score
+        finalized=False,  # Unfinalize when clearing
+    )
+
+    # --- Update DataFrame in memory ---
+    if save_success and "df" in st.session_state:
         try:
-            email = st.session_state.selected_response.split("`")[
-                1
-            ]  # Extract email from format
-            # Clear the specific fields in session state
-            st.session_state[f"teacher_score_{email}"] = None
-            st.session_state[f"teacher_notes_{email}"] = ""
-            # Save the cleared state to database
-            save_enriched_data(
-                email=email,
-                ai_output=st.session_state.get(
-                    "prev_eval"
-                ),  # Keep existing AI evaluation
-                teacher_notes="",
-                teacher_score=None,
-                finalized=False,  # Unfinalize when clearing
-            )
-            st.rerun()
+            df_current = st.session_state.df
+            # Need email_col to find the row
+            email_col = "email"  # Assuming this is the correct column name
+            idx = df_current.index[df_current[email_col] == email].tolist()
+            if idx:
+                update_idx = idx[0]
+                df_current.loc[update_idx, "teacher_notes"] = ""
+                df_current.loc[update_idx, "teacher_score"] = None
+                df_current.loc[update_idx, "finalized"] = (
+                    False  # Also unfinalize in memory
+                )
+                df_current.loc[update_idx, "last_modified"] = datetime.now()
+                st.session_state.df = df_current  # Store updated df back
+                logger.debug(f"Updated session state df after clearing for {email}")
+            else:
+                logger.error(
+                    f"Could not find index for {email} in session_state df after clear."
+                )
         except Exception as e:
-            logger.error(f"Error clearing teacher score: {e}")
+            logger.error(f"Error updating session state df after clear: {e}")
+    elif not save_success:
+        logger.error(
+            f"Skipping session state df update for {email} due to save failure."
+        )
+    elif "df" not in st.session_state:
+        logger.error(
+            f"Skipping session state df update for {email} because 'df' not in session state."
+        )
+
+    # Delete the specific keys from session state to reset widgets
+    score_key = f"teacher_score_{email}"
+    notes_key = f"teacher_notes_{email}"
+    if score_key in st.session_state:
+        del st.session_state[score_key]
+    if notes_key in st.session_state:
+        del st.session_state[notes_key]
+
+    # 🔄 refresh the full app now, fragment scope won't work
+    st.rerun()
+
+
+@st.dialog("Confirm Clear")
+def confirm_clear_dialog(email_to_clear):
+    """Displays a confirmation dialog for clearing teacher scores and notes."""
+    st.warning(
+        f"Are you sure you want to clear the score and notes for {email_to_clear}?"
+    )
+    col1, col2 = st.columns(2)  # Use st.columns inside the dialog function
+    with col1:
+        if st.button("Yes, Clear", type="primary", use_container_width=True):
+            clear_teacher_evaluation(email_to_clear)  # Pass email
+            # The rerun in clear_teacher_evaluation will close the dialog
+    with col2:
+        if st.button("Cancel", use_container_width=True):
+            # No action needed, simply closes the dialog by ending the function run
+            pass
 
 
 # Use the value from session state as the source of truth during the run
@@ -806,13 +1075,21 @@ if df_raw is not None:
         df = get_merged_data(df_raw, email_col)
         logger.info(f"Loaded {len(df)} responses successfully!")
 
+        # Build filter widgets before applying filters
+        build_filter_widgets(df, teacher_col, hour_col)
+
+        # Apply filters based on session state
+        df_filtered = apply_filters(df, teacher_col, hour_col)
+
         # --- State Synchronization (Session State & Query Params) ---
         # 1. Get potential values from session state and query params
         state_response = st.session_state.get("selected_response", None)
         qp_response = st.query_params.get("response", None)
 
         # 2. Generate response options first so we can validate against them
-        response_options = generate_response_options(df, email_col, name_col)
+        response_options, display_mapping = generate_response_options(
+            df_filtered, email_col, name_col, "_main"
+        )
 
         # 3. Validate current selection against available options
         current_response = None
@@ -858,63 +1135,21 @@ if df_raw is not None:
         )  # More precise
 
         # Filtering section
-        st.sidebar.header("Filter Responses")
+        # build_filter_widgets(df, teacher_col, hour_col) # REMOVE THIS LINE
 
-        # Use detected column names here
-        selected_teacher = "All"
-        if teacher_col:
-            teachers = ["All"] + sorted(df[teacher_col].unique().tolist())
-            selected_teacher = st.sidebar.selectbox("Teacher:", teachers)
-        else:
-            logger.info("Teacher column not detected, filter disabled.")
+        # Generate response options from filtered DataFrame
+        response_options, display_mapping = generate_response_options(
+            df_filtered, email_col, name_col, "_main"
+        )
 
-        # Use detected column names here
-        selected_hour = "All"
-        if hour_col:
-            hours = ["All"] + sorted(df[hour_col].unique().tolist())
-            selected_hour = st.sidebar.selectbox("Hour:", hours)
-        else:
-            logger.info("Hour column not detected, filter disabled.")
-
-        # Add status filter
-        status_options = ["All", "Not Started", "In Progress", "Finalized"]
-        selected_status = st.sidebar.selectbox("Review Status:", status_options)
-
-        # Apply filters
-        filtered_df = df.copy()
-        if selected_teacher != "All" and teacher_col:
-            filtered_df = filtered_df[filtered_df[teacher_col] == selected_teacher]
-        if selected_hour != "All" and hour_col:
-            filtered_df = filtered_df[filtered_df[hour_col] == selected_hour]
-        if selected_status != "All":
-            if selected_status == "Not Started":
-                # More robust check for "Not Started" (handles None, NaN, empty dicts)
-                filtered_df = filtered_df[
-                    filtered_df["ai_evaluation"].apply(
-                        lambda x: not isinstance(x, dict) or not x
-                    )
-                    & (
-                        ~filtered_df["finalized"].fillna(False)
-                    )  # Ensure not finalized either
-                ]
-            elif selected_status == "In Progress":
-                # Check for non-empty dict in ai_evaluation AND not finalized
-                filtered_df = filtered_df[
-                    filtered_df["ai_evaluation"].apply(
-                        lambda x: isinstance(x, dict) and bool(x)
-                    )
-                    & (~filtered_df["finalized"].fillna(False))
-                ]
-            elif selected_status == "Finalized":
-                filtered_df = filtered_df[filtered_df["finalized"].fillna(False)]
+        # Store in session state for consistency
+        st.session_state.response_options = response_options
 
         # --- Add Debugging ---
         if logger.getEffectiveLevel() <= logging.DEBUG:
-            logger.debug(f"Filtered DataFrame Length: {len(filtered_df)}")
-            if not filtered_df.empty:
-                logger.debug(
-                    "Filtered DataFrame Head:\n" + filtered_df.head().to_string()
-                )
+            logger.debug(f"Filtered DataFrame Length: {len(df)}")
+            if not df.empty:
+                logger.debug("Filtered DataFrame Head:\n" + df.head().to_string())
         # --- End Debugging ---
 
         # Progress metrics for filtered data
@@ -925,63 +1160,35 @@ if df_raw is not None:
         #     st.write("DEBUG: About to process columns and set up sidebar...")
 
         # Calculate metrics for filtered data
-        filtered_total = len(filtered_df)
-        # Count rows where ai_evaluation is a non-empty dict
-        filtered_evaluated = (
-            filtered_df["ai_evaluation"]
-            .apply(lambda x: isinstance(x, dict) and bool(x))
-            .sum()
-        )
-        filtered_finalized = filtered_df["finalized"].fillna(False).sum()
-        # Correctly calculate not started/in progress for filtered data
-        filtered_in_progress = filtered_evaluated - filtered_finalized
+        filtered_total = len(df_filtered)
+        # --- Recalculate counts based on status icon logic --- #
+        filtered_teacher_scored = df_filtered[
+            pd.notna(df_filtered["teacher_score"])
+            | (df_filtered["teacher_notes"].fillna("").str.strip() != "")
+        ].shape[0]
+        filtered_ai_evaluated_only = df_filtered[
+            df_filtered["ai_evaluation"].apply(
+                lambda x: isinstance(x, dict) and bool(x)
+            )
+            & ~(  # Exclude those already teacher scored
+                pd.notna(df_filtered["teacher_score"])
+                | (df_filtered["teacher_notes"].fillna("").str.strip() != "")
+            )
+        ].shape[0]
         filtered_not_started = (
-            filtered_total - filtered_in_progress - filtered_finalized
+            filtered_total - filtered_teacher_scored - filtered_ai_evaluated_only
         )
+        # --- End Recalculation --- #
 
         # Combined section for filter summary and response selection
         st.sidebar.markdown(
             f"""
         ### 📝 Responses
-        {filtered_total} total • ⚪️ {filtered_not_started} • 🟡 {filtered_in_progress} • 🟢 {filtered_finalized}
+        {filtered_total} total • ⚪️ {filtered_not_started} • 🟡 {filtered_ai_evaluated_only} • 🟢 {filtered_teacher_scored}
         """
         )
 
-        # Find the index of the current selection in the options list
-        current_selection_index = None
-        if current_response and response_options:
-            try:
-                current_selection_index = response_options.index(current_response)
-            except ValueError:
-                logger.warning(
-                    f"Current response '{current_response}' not found in options list. This should not happen due to earlier validation."
-                )
-                current_selection_index = None
-
-        # Add the radio list to choose a response
-        st.sidebar.radio(
-            "Select Response:",
-            options=response_options,
-            index=current_selection_index if current_selection_index is not None else 0,
-            on_change=set_selection_state,  # Use the callback
-            key="response_selector",  # Use a STATIC key
-            label_visibility="collapsed",  # Hide label if desired
-        )
-
-        # Add Start Review button
-        if (
-            response_options and not current_response
-        ):  # Only show when no response is selected
-            first_response = response_options[0] if response_options else None
-            if first_response:
-                st.sidebar.button(
-                    "✨ Start Review",
-                    type="primary",
-                    on_click=set_selection_state,
-                    kwargs={"target": first_response},
-                    use_container_width=True,
-                )
-
+        # --- MOVED BATCH EVALUATION BUTTON HERE --- #
         # Add batch evaluation callback
         def run_batch_evaluation():
             """Callback to run batch evaluation and ensure UI updates."""
@@ -1031,39 +1238,89 @@ if df_raw is not None:
                 st.session_state.batch_eval_complete = False
                 # Rerun here in the main flow
                 st.rerun()
+        # --- END MOVED BATCH EVALUATION BUTTON --- #
+
+        # Add show names checkbox just before the response list
+        def on_show_names_change():
+            """Callback when show_names checkbox changes."""
+            # Force rerun to update all displays
+            pass
+
+        # Place the checkbox with a static key and explicit callback
+        show_names = st.sidebar.checkbox(
+            "Show Names",
+            value=st.session_state.get("show_names", False),
+            key="show_names",
+            on_change=on_show_names_change,
+        )
+
+        # Find the index of the current selection in the options list
+        current_selection_index = None
+        if current_response and response_options:
+            try:
+                current_selection_index = response_options.index(current_response)
+            except ValueError:
+                # If current selection is not in filtered list, clear it
+                if "selected_response" in st.session_state:
+                    del st.session_state["selected_response"]
+                current_response = None
+                st.query_params.clear()
+                current_selection_index = 0
+
+        # Add the radio list to choose a response (directly in sidebar)
+        st.sidebar.radio(
+            "Select Response:",
+            options=response_options,  # List of emails
+            index=current_selection_index if current_selection_index is not None else 0,
+            format_func=lambda email: display_mapping.get(
+                email, email
+            ),  # Use mapping for display
+            on_change=set_selection_state,  # Use the callback
+            key="response_selector",  # Use a STATIC key
+            label_visibility="collapsed",  # Hide label if desired
+        )
 
         # Main content area
         # Show response details only if a response is selected AND initial load is complete
         if current_response and st.session_state.get("initial_load_complete", False):
             try:
-                # Extract email from the selected label (split by backtick)
-                # Example format: "🟢 Student Name (`student@example.com`)"
-                parts = current_response.split("`")
-                if len(parts) >= 2:
-                    selected_email = parts[-2]
-                else:
-                    raise ValueError("Could not parse email from selection label")
-
-                # Find the selected row in the *filtered* DataFrame
-                selected_rows = filtered_df[filtered_df[email_col] == selected_email]
+                # Find the selected row in the *original* DataFrame (df) using the email
+                selected_rows = df[df[email_col] == current_response]
 
                 if selected_rows.empty:
-                    # Handle case where selected response is no longer in filtered list
-                    logger.warning(
-                        f"Selected response {selected_email} not found in *filtered* data. Clearing selection."
+                    # Handle case where selected response is no longer in the main df
+                    # (Should be less likely now, but good to keep)
+                    logger.error(
+                        f"Selected email '{current_response}' not found in main data. Clearing selection."
                     )
                     st.warning(
-                        "The previously selected response is no longer visible with the current filters. Please select another response."
+                        "The selected response data could not be found. Please select another response."
+                    )
+                    if "selected_response" in st.session_state:
+                        del st.session_state["selected_response"]
+                    current_response = None
+                    st.query_params.clear()
+                    st.rerun()  # Rerun to clear the view
+
+                # Proceed assuming selected_rows is not empty
+                selected_row = selected_rows.iloc[0]
+                # Find index in the *email* options list (for nav buttons)
+                # Ensure current_response (email) is still valid before finding index
+                if current_response in response_options:
+                    current_idx = response_options.index(current_response)
+                else:
+                    # This case means the selected email is valid in `df` but not in the current `response_options` (e.g., due to filters)
+                    logger.warning(
+                        f"Selected email '{current_response}' exists in data but not in current filter options. Clearing selection."
+                    )
+                    st.warning(
+                        "The previously selected response is not visible with the current filters. Please select another response."
                     )
                     if "selected_response" in st.session_state:
                         del st.session_state["selected_response"]
                     current_response = None
                     st.query_params.clear()
                     st.rerun()
-
-                selected_row = selected_rows.iloc[0]
-                # Find index in the potentially filtered response_options list
-                current_idx = response_options.index(current_response)
 
                 # Status indicator
                 status_col1, status_col2 = st.columns([3, 1])
@@ -1078,7 +1335,7 @@ if df_raw is not None:
                         and isinstance(selected_row.get("ai_evaluation"), dict)
                         and selected_row.get("ai_evaluation")
                     ):
-                        st.warning("🟡 Review In Progress")
+                        st.warning("🟡 Ready for Review")
                     else:
                         st.info("⚪️ Not Yet Evaluated")
                 with status_col2:
@@ -1154,13 +1411,13 @@ if df_raw is not None:
                         ):
                             # Fallback: try parsing if it's somehow still a string
                             logger.warning(
-                                f"AI evaluation for {selected_email} was a string, attempting parse."
+                                f"AI evaluation for {current_response} was a string, attempting parse."
                             )
                             prev_eval = json.loads(evaluation_data)
                         else:
                             # This case should be less likely now with the improved has_evaluation check
                             logger.warning(
-                                f"AI evaluation data for {selected_email} is not a valid dict: {evaluation_data}"
+                                f"AI evaluation data for {current_response} is not a valid dict: {evaluation_data}"
                             )
                             st.warning(
                                 "Could not display previous AI evaluation data (invalid format)."
@@ -1202,7 +1459,7 @@ if df_raw is not None:
                         else:
                             # This condition means has_evaluation was true, but prev_eval didn't become a dict
                             logger.error(
-                                f"Evaluation data existed for {selected_email} but failed to load as dict: {evaluation_data}"
+                                f"Evaluation data existed for {current_response} but failed to load as dict: {evaluation_data}"
                             )
                             st.error(
                                 "Could not load previous evaluation data despite it being present."
@@ -1213,17 +1470,34 @@ if df_raw is not None:
                             f"Could not parse previous evaluation data (JSON error): {e}"
                         )
                         logger.error(
-                            f"Error parsing evaluation JSON for {selected_email}: {e}"
+                            f"Error parsing evaluation JSON for {current_response}: {e}"
                         )
                     except Exception as e:
                         st.error(f"Could not load previous evaluation data: {e}")
                         logger.error(
-                            f"Error loading evaluation data for {selected_email}: {e}"
+                            f"Error loading evaluation data for {current_response}: {e}"
                         )
 
                 # Display AI scores just before teacher evaluation
                 # Check if prev_eval is a valid dictionary before proceeding
-                if prev_eval and isinstance(prev_eval, dict):
+                rerun_button = False  # Initialize rerun_button flag
+
+                st.markdown("#### ✨🦔 AI Evaluation")
+
+                if not prev_eval or not isinstance(prev_eval, dict):
+                    # Show evaluate button when no evaluation exists
+                    if st.button(
+                        "Evaluate with AI",
+                        icon="✨",
+                        type="primary",
+                        use_container_width=True,
+                        key="eval_button",
+                    ):
+                        st.session_state.confirm_rerun = False  # Reset just in case
+                        rerun_button = True  # Set flag to proceed
+                        # Store current selection before rerunning
+                        st.session_state.selected_response = current_response
+                else:
                     try:
                         # Provide default empty dict if key is missing
                         scores = prev_eval.get("rubric_scores", {})
@@ -1258,8 +1532,6 @@ if df_raw is not None:
                         """,
                             unsafe_allow_html=True,
                         )
-
-                        st.markdown("#### ✨🦔 AI Rubric Scores")
 
                         # Create container for scores
                         score_container = st.container()
@@ -1329,62 +1601,41 @@ if df_raw is not None:
                                 )
 
                             # Add rerun button below scores
-                            rerun_button = False  # Initialize
-                            if llm and evaluation_prompt:
-                                button_label = (
-                                    "🔄:hedgehog: Rerun Evaluation"
-                                    if has_evaluation
-                                    else "🤖 Evaluate with AI"
+                            rerun_button_clicked = (  # Use different variable name
+                                st.button(
+                                    "🔄🦔 Rerun Evaluation",
+                                    type="secondary",
+                                    use_container_width=True,
+                                    key="eval_rerun_button",  # Keep key simple
                                 )
-                                rerun_button_clicked = (
-                                    st.button(  # Use different variable name
-                                        button_label,
-                                        type="secondary",
-                                        use_container_width=True,
-                                        key="eval_rerun_button",  # Keep key simple
-                                    )
-                                )
-                                # Add confirmation only for rerun
-                                if rerun_button_clicked and has_evaluation:
-                                    if not st.session_state.get("confirm_rerun", False):
-                                        st.session_state.confirm_rerun = True
-                                        st.rerun()  # Rerun to show checkbox
+                            )
+                            # Add confirmation only for rerun
+                            if rerun_button_clicked and has_evaluation:
+                                if not st.session_state.get("confirm_rerun", False):
+                                    st.session_state.confirm_rerun = True
+                                    # Now just let the script continue to show the checkbox
 
-                                    if st.session_state.get("confirm_rerun", False):
-                                        confirm_key = f"rerun_confirm_{selected_email}"  # Unique key
-                                        if st.checkbox(
-                                            "✓ Confirm AI rerun", key=confirm_key
-                                        ):
-                                            st.session_state.confirm_rerun = (
-                                                False  # Reset on confirm
-                                            )
-                                            rerun_button = True  # Set flag to proceed
-                                        else:
-                                            rerun_button = False  # Checkbox not ticked
-                                            # Keep confirm_rerun = True until checkbox is ticked or user navigates away
-                                    # No confirmation needed if it's the first evaluation
-                                elif rerun_button_clicked and not has_evaluation:
-                                    st.session_state.confirm_rerun = (
-                                        False  # Reset just in case
-                                    )
-                                    rerun_button = True  # Set flag to proceed
+                                if st.session_state.get("confirm_rerun", False):
+                                    confirm_key = f"rerun_confirm_{current_response}"  # Unique key
 
                     except Exception as e:
                         st.error("Could not display AI scores")
                         logger.error(
-                            f"Error displaying AI scores for {selected_email}: {e}"
+                            f"Error displaying AI scores for {current_response}: {e}"
                         )
 
                 # Teacher evaluation section
                 st.markdown("### 👩‍🏫 Teacher Score")
 
-                # Add clear button above the evaluation fields
+                # Clear button triggers dialog
                 if st.button(
                     "🗑️ Clear Score and Notes",
                     type="secondary",
                     help="Clear teacher score and notes",
+                    key=f"clear_btn_{current_response}",  # Unique key per response
                 ):
-                    clear_teacher_evaluation()
+                    # Call the decorated dialog function
+                    confirm_clear_dialog(current_response)  # Pass the email
 
                 # Create two columns for score and notes
                 score_col, notes_col = st.columns([1, 3])
@@ -1414,7 +1665,7 @@ if df_raw is not None:
                         index=score_index,
                         help="Select score from 4-1",
                         label_visibility="collapsed",
-                        key=f"teacher_score_{selected_email}",  # Unique key per response
+                        key=f"teacher_score_{current_response}",  # Unique key per response
                     )
 
                     if teacher_score is None:
@@ -1431,7 +1682,7 @@ if df_raw is not None:
                         value=current_notes,
                         height=100,
                         placeholder="Add your evaluation notes, observations, or feedback...",
-                        key=f"teacher_notes_{selected_email}",  # Unique key per response
+                        key=f"teacher_notes_{current_response}",  # Unique key per response
                     )
                     st.caption(f"{len(teacher_notes)}/500 characters")
 
@@ -1452,65 +1703,88 @@ if df_raw is not None:
                 # Next button
                 if current_idx < len(response_options) - 1:
                     next_target = response_options[current_idx + 1]
+
+                    def save_if_changed_and_next(
+                        current_email,
+                        next_email,
+                        current_notes_widget_key,
+                        current_score_widget_key,
+                        current_row_data,  # Pass the row data dictionary
+                    ):
+                        """Saves teacher input if changed, then navigates to the next response."""
+                        logger.debug(
+                            f"save_if_changed_and_next called for {current_email}, moving to {next_email}"
+                        )
+
+                        # Get current widget values
+                        current_notes = st.session_state.get(
+                            current_notes_widget_key, ""
+                        )
+                        current_score = st.session_state.get(
+                            current_score_widget_key, None
+                        )
+
+                        # Get original values (or defaults if not present)
+                        original_notes = current_row_data.get("teacher_notes", "")
+                        original_score = current_row_data.get("teacher_score")
+                        # Handle potential NaN from pandas for score comparison
+                        original_score_int = None
+                        if pd.notna(original_score):
+                            try:
+                                original_score_int = int(float(original_score))
+                            except (ValueError, TypeError):
+                                original_score_int = (
+                                    None  # Treat invalid original scores as None
+                                )
+
+                        # Check if anything changed
+                        notes_changed = current_notes != original_notes
+                        score_changed = current_score != original_score_int
+
+                        if notes_changed or score_changed:
+                            logger.info(
+                                f"Saving changes for {current_email} before moving to next."
+                            )
+                            save_success = save_enriched_data(
+                                email=current_email,
+                                ai_output=current_row_data.get(
+                                    "ai_evaluation"
+                                ),  # Preserve AI eval
+                                teacher_notes=current_notes,  # Use widget value
+                                teacher_score=current_score,  # Use widget value
+                                finalized=current_row_data.get(
+                                    "finalized", False
+                                ),  # Preserve finalized status
+                            )
+                            if not save_success:
+                                st.error(
+                                    f"Failed to save changes for {current_email}. Please check logs."
+                                )
+                                logger.error(
+                                    f"Failed to save changes automatically for {current_email} when navigating."
+                                )
+                                # --- Still proceed to next even if save fails ---
+                        else:
+                            logger.debug(
+                                f"No changes detected for {current_email}, moving to next without saving."
+                            )
+
+                        # Navigate to the next response by setting state and rerunning
+                        set_selection_state(target=next_email)
+                        # No explicit rerun needed here, set_selection_state causes one if value changed
+
                     nav_cols[1].button(
                         "Next →",
                         use_container_width=True,
-                        on_click=set_selection_state,
-                        kwargs={"target": next_target},  # Pass as kwargs
+                        on_click=save_if_changed_and_next,
+                        kwargs={
+                            "current_email": current_response,
+                            "next_email": next_target,
+                            "current_notes_widget_key": f"teacher_notes_{current_response}",
+                            "current_score_widget_key": f"teacher_score_{current_response}",
+                            "current_row_data": selected_row.to_dict(),  # Pass current data
+                        },
                     )
-
-                # Run evaluation if requested (check rerun_button flag)
-                if llm and evaluation_prompt and rerun_button:
-                    with st.spinner("Running AI evaluation..."):
-                        try:
-                            st.session_state.confirm_rerun = (
-                                False  # Reset confirm after trigger
-                            )
-                            logger.info(
-                                f"Starting AI evaluation/rerun process for {selected_email}"
-                            )
-                            evaluation = run_evaluation(
-                                llm,
-                                evaluation_prompt,
-                                selected_row.get(PART1_COL, ""),
-                                selected_row.get(PART2_COL, ""),
-                            )
-                            logger.debug(
-                                f"AI evaluation result for {selected_email}: {evaluation}"
-                            )
-
-                            # Save the evaluation result
-                            if evaluation and isinstance(
-                                evaluation, dict
-                            ):  # Ensure valid result
-                                # Use the current teacher score and notes if available
-                                save_success = save_enriched_data(
-                                    selected_email,
-                                    evaluation,  # Pass the new evaluation dict
-                                    teacher_notes,
-                                    teacher_score,  # Pass current teacher score
-                                    selected_row.get(
-                                        "finalized", False
-                                    ),  # Keep existing finalized status
-                                )
-                                if save_success:
-                                    st.success("AI evaluation saved successfully!")
-                                    # Update prev_eval in the current run so UI updates immediately if needed
-                                    prev_eval = evaluation
-                                    st.rerun()
-                                else:
-                                    st.error("Failed to save AI evaluation")
-                            else:
-                                st.error("AI evaluation returned no valid results")
-
-                        except Exception as e:
-                            st.error(f"Error running AI evaluation: {str(e)}")
-                            logger.error(
-                                f"AI evaluation error for {selected_email}: {str(e)}"
-                            )
-                            logger.error(
-                                f"Selected row columns: {selected_row.index.tolist()}"
-                            )
 
             except (IndexError, ValueError) as e:
                 # Check if the error is specifically because the index wasn't found
@@ -1523,7 +1797,7 @@ if df_raw is not None:
                     )
                 elif isinstance(e, IndexError):
                     logger.error(
-                        f"IndexError accessing filtered_df for {selected_email}. Filtered list might be empty unexpectedly. {e}"
+                        f"IndexError accessing filtered_df for {current_response}. Filtered list might be empty unexpectedly. {e}"
                     )
                     st.error(
                         "An internal error occurred trying to access the selected response data."
@@ -1539,7 +1813,6 @@ if df_raw is not None:
                     del st.session_state["selected_response"]
                 current_response = None  # Clear local var
                 st.query_params.clear()
-                st.rerun()
 
         else:
             # Welcome/instruction state (shows on initial load or if no response selected)
@@ -1576,14 +1849,20 @@ if df_raw is not None:
 
                 # Calculate metrics
                 total = len(df)
-                evaluated = (
-                    df["ai_evaluation"]
-                    .apply(lambda x: isinstance(x, dict) and bool(x))
-                    .sum()
-                )
-                finalized = df["finalized"].fillna(False).sum()
-                in_progress = evaluated - finalized
-                not_started = total - evaluated  # Simpler calculation
+                # --- Recalculate counts based on status icon logic --- #
+                teacher_scored = df[
+                    pd.notna(df["teacher_score"])
+                    | (df["teacher_notes"].fillna("").str.strip() != "")
+                ].shape[0]
+                ai_evaluated_only = df[
+                    df["ai_evaluation"].apply(lambda x: isinstance(x, dict) and bool(x))
+                    & ~(  # Exclude those already teacher scored
+                        pd.notna(df["teacher_score"])
+                        | (df["teacher_notes"].fillna("").str.strip() != "")
+                    )
+                ].shape[0]
+                not_started = total - teacher_scored - ai_evaluated_only
+                # --- End Recalculation --- #
 
                 # Display metrics in columns
                 col1, col2, col3, col4 = st.columns(4)
@@ -1596,24 +1875,58 @@ if df_raw is not None:
                     )
                 with col3:
                     st.metric(
-                        " 🟡 AI Evaluated",
-                        f"{in_progress}",
+                        "🟡 AI Evaluated",
+                        f"{ai_evaluated_only}",
                     )
 
                 with col4:
                     st.metric(
-                        " 🟢 Teacher Scored",
-                        f"{finalized}",
+                        "🟢 Teacher Scored",
+                        f"{teacher_scored}",
                     )
+
+                # Add Start Review button after metrics
+                st.divider()
+                start_col1, start_col2, start_col3 = st.columns([1, 2, 1])
+                with start_col2:
+                    if response_options:  # Only show if there are responses to review
+                        # Filter for responses that haven't been scored by teacher WITHIN THE FILTERED VIEW
+                        unscored_df = df_filtered[
+                            pd.isna(df_filtered["teacher_score"])
+                        ]  # Use df_filtered here
+                        if not unscored_df.empty:
+                            # Generate options only for unscored responses FROM THE FILTERED VIEW
+                            unscored_options, unscored_display_mapping = (
+                                generate_response_options(
+                                    unscored_df, email_col, name_col, "_unscored"
+                                )
+                            )
+                            if unscored_options:
+                                first_unscored = unscored_options[0]
+                                st.button(
+                                    # Use the length of the FILTERED unscored options
+                                    f"✨ Review {len(unscored_options)} Selected Unscored Responses",
+                                    type="primary",
+                                    on_click=set_selection_state,
+                                    kwargs={
+                                        "target": first_unscored
+                                    },  # Target the first from the FILTERED list
+                                    use_container_width=True,
+                                )
+                            else:
+                                st.success(
+                                    "🎉 All filtered responses have been scored!"
+                                )  # Adjusted message
+                        else:
+                            st.success(
+                                "🎉 All filtered responses have been scored!"
+                            )  # Adjusted message
 
             # Set the flag indicating the initial load process is complete
             st.session_state.initial_load_complete = True
 
         # Update filtered metrics for session state
         st.session_state.filtered_total = filtered_total
-        st.session_state.filtered_evaluated = filtered_evaluated
-        st.session_state.filtered_finalized = filtered_finalized
-        st.session_state.filtered_in_progress = filtered_in_progress
         st.session_state.filtered_not_started = filtered_not_started
 
         # Store the current DataFrame in session state
@@ -1624,8 +1937,3 @@ else:
     st.error(
         "🔴 Failed to load responses from Google Sheet. Please check logs or credentials."
     )
-
-
-def get_current_time() -> str:
-    """Get current time in ISO format."""
-    return datetime.now().isoformat()
