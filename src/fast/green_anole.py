@@ -23,8 +23,6 @@ from langchain import hub
 # Load environment variables first
 load_dotenv()
 
-ALLOWED_EMAILS = os.getenv("ALLOWED_EMAILS", "").split(",")
-
 # Configure logging
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logger = logging.getLogger("streamlit")
@@ -34,6 +32,12 @@ if not logger.handlers:
     logger.addHandler(handler)
 logger.setLevel(getattr(logging, log_level))
 logger.debug(f"Log level set to: {log_level}")
+
+client_config = st.secrets.get("client", {})
+logger.debug(f"client_config: {client_config}")
+
+ALLOWED_EMAILS = client_config.get("allowed_emails", "").split(",")
+EMAIL_TO_TEACHER = client_config.get("email_teacher_name", {})
 
 # --- Column detection configuration with regex and fuzzy matching ---
 COLUMN_PATTERNS = {
@@ -395,15 +399,18 @@ def get_google_sheet():
         )
         logger.error(
             f"User {st.experimental_user.email} is not authorized to access this tool."
+            f"Allowed emails: {ALLOWED_EMAILS}"
         )
         st.stop()
 
     try:
         # Debug: Print credentials path
         logger.debug("Attempting to load credentials...")
-        credentials = st.secrets["google_service_account"]
-        # Create a client to interact with Google Sheets
-        client = gspread.authorize(credentials)
+        creds_dict = st.secrets["google_service_account"]
+        # Use Credentials.from_service_account_info to parse the dictionary
+        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPE)
+        # Create a client to interact with Google Sheets using the parsed credentials
+        client = gspread.authorize(creds)
         logger.debug("Google Sheets client authorized")
 
         # Get the spreadsheet - using environment variable for sheet URL/ID

@@ -1,6 +1,7 @@
 import logging
-from venv import logger
 import streamlit as st
+
+logger = logging.getLogger("streamlit")
 
 CLIENT_NAME = st.secrets.get("CLIENT_NAME", "Eddo")
 
