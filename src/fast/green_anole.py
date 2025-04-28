@@ -23,6 +23,8 @@ from langchain import hub
 # Load environment variables first
 load_dotenv()
 
+ALLOWED_EMAILS = os.getenv("ALLOWED_EMAILS", "").split(",")
+
 # Configure logging
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logger = logging.getLogger("streamlit")
@@ -369,6 +371,21 @@ def apply_filters(
 
 def get_google_sheet():
     """Connect to Google Sheets and return the worksheet data with normalized column names"""
+
+    # Assert authorized user
+    try:
+        email = st.experimental_user.email
+        assert email in ALLOWED_EMAILS, "You are not authorized to access this tool."
+    except Exception as e:
+        logger.error(f"Error getting user email: {e}")
+        st.error(  
+            "You are not authorized to access this tool. Contact aw@eddolearning.com for access."
+        )
+        logger.error(
+            f"User {st.experimental_user.email} is not authorized to access this tool."
+        )
+        st.stop()
+
     try:
         # Debug: Print credentials path
         logger.debug("Attempting to load credentials...")
