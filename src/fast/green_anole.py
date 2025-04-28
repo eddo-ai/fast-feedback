@@ -36,8 +36,8 @@ logger.debug(f"Log level set to: {log_level}")
 client_config = st.secrets.get("client", {})
 logger.debug(f"client_config: {client_config}")
 
-ALLOWED_EMAILS = client_config.get("allowed_emails", "").split(",")
-EMAIL_TO_TEACHER = client_config.get("email_teacher_name", {})
+st.session_state.allowed_emails = client_config.get("allowed_emails", "").split(",")
+st.session_state.email_to_teacher = client_config.get("email_teacher_name", None)
 
 # --- Column detection configuration with regex and fuzzy matching ---
 COLUMN_PATTERNS = {
@@ -391,7 +391,9 @@ def get_google_sheet():
     # Assert authorized user
     try:
         email = st.experimental_user.email
-        assert email in ALLOWED_EMAILS, "You are not authorized to access this tool."
+        assert email in st.session_state.get(
+            "allowed_emails", []
+        ), "You are not authorized to access this tool."
     except Exception as e:
         logger.error(f"Error getting user email: {e}")
         st.error(
@@ -399,7 +401,7 @@ def get_google_sheet():
         )
         logger.error(
             f"User {st.experimental_user.email} is not authorized to access this tool."
-            f"Allowed emails: {ALLOWED_EMAILS}"
+            f"Allowed emails: {st.session_state.get('allowed_emails', [])}"
         )
         st.stop()
 
