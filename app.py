@@ -3,10 +3,11 @@ import streamlit as st
 
 logger = logging.getLogger("streamlit")
 
-CLIENT_NAME = st.secrets.get("CLIENT_NAME", "Eddo")
+client_config = st.secrets.get("client", {})
+st.session_state.client_name = client_config.get("name", "Eddo")
 
 st.set_page_config(
-    page_title=f"🦔 {CLIENT_NAME} AI Tools by Eddo Learning",
+    page_title=f"🦔 {st.session_state.get('client_name', 'Eddo')} AI Tools by Eddo Learning",
     page_icon="🦔",
     layout="wide",
 )
