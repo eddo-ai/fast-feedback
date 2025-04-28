@@ -346,7 +346,6 @@ def get_feedback_filename(original_filename, suffix=""):
 # Instructions setup section
 st.header("1. Criteria")
 
-
 st.write("### Student Instructions")
 instructions_file = st.file_uploader(
     "Upload Student Instructions",
@@ -354,8 +353,8 @@ instructions_file = st.file_uploader(
 )
 if instructions_file:
     st.session_state.student_instructions = read_file_upload(instructions_file)
-    with st.expander("Instructions preview"):
-        st.write(st.session_state.student_instructions)
+    st.write("Instructions preview:")
+    st.write(st.session_state.student_instructions)
 
 st.write("### Grading Rubric")
 rubric_file = st.file_uploader(
@@ -364,8 +363,8 @@ rubric_file = st.file_uploader(
 )
 if rubric_file:
     st.session_state.grading_instructions = read_file_upload(rubric_file)
-    with st.expander("Rubric preview"):
-        st.write(st.session_state.grading_instructions)
+    st.write("Rubric preview:")
+    st.write(st.session_state.grading_instructions)
 
 # Process responses section
 if not (

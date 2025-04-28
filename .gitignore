@@ -4,3 +4,5 @@
 .vscode/
 .DS_Store
 data
+.credentials/credentials.json
+src/fast/enriched_data.db
