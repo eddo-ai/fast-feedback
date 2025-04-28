@@ -13,6 +13,7 @@ dependencies = [
     "markdown>=3.7",
     "gspread>=6.2.0",
     "rich>=13.9.4",
+    "authlib>=1.5.2",
 ]
 
 [build-system]
