@@ -401,13 +401,7 @@ def get_google_sheet():
     try:
         # Debug: Print credentials path
         logger.debug("Attempting to load credentials...")
-        creds_path = ".credentials/credentials.json"
-        logger.debug(f"Looking for credentials at: {os.path.abspath(creds_path)}")
-
-        # Load credentials from the .credentials directory
-        credentials = Credentials.from_service_account_file(creds_path, scopes=SCOPE)
-        logger.debug("Credentials loaded successfully")
-
+        credentials = st.secrets["google_service_account"]
         # Create a client to interact with Google Sheets
         client = gspread.authorize(credentials)
         logger.debug("Google Sheets client authorized")
