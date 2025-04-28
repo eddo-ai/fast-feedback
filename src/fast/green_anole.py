@@ -1,6 +1,8 @@
 import streamlit as st
 import gspread
 import pandas as pd
+import re
+from difflib import get_close_matches
 from google.oauth2.service_account import Credentials
 import os
 from dotenv import load_dotenv
@@ -18,17 +20,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from langchain_openai import AzureChatOpenAI
 from langchain import hub
 
-# --- Local Imports ---
-
-
 # Load environment variables first
 load_dotenv()
-
 
 # Configure logging
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logger = logging.getLogger("streamlit")
-# Ensure handler is present and set to configured level
 if not logger.handlers:
     handler = logging.StreamHandler()
     handler.setLevel(getattr(logging, log_level))
@@ -36,11 +33,122 @@ if not logger.handlers:
 logger.setLevel(getattr(logging, log_level))
 logger.debug(f"Log level set to: {log_level}")
 
-# --- Constants ---
-# Define column names from Google Sheet to avoid relying on index
-# (These might need adjustment if the Sheet structure changes)
-PART1_COL = "1. What do you notice about the behavior and body structures of the green lizards who live on islands with brown lizards versus the green lizards who live on islands with no brown lizards?"
-PART2_COL = "2. Construct an explanation: How does natural selection explain the changes in the green lizard population over time?\n- Take out your Copy of Our General  Model\n- Use the key parts of the General Model to explain the cause and effect of the changes in the green lizard population over time.\nIn your explanation make sure to include the following:\n  - the key parts of the model\n  - cause and effect to describe how the population changed over time\n - the data about the green and brown lizard populations that support your explanation"
+# --- Column detection configuration with regex and fuzzy matching ---
+COLUMN_PATTERNS = {
+    "timestamp": [r"^Timestamp$", r"^timestamp$"],
+    "email": [r"Email Address", r"Email", r"email", r"Student Email"],
+    "name": [r"Student Name", r"Name", r"Full Name", r"name", r"Student"],
+    "teacher": [r"Teacher Name", r"Teacher", r"teacher_name", r"teacher"],
+    "hour": [r"Hour", r"Period", r"Class Period", r"hour"],
+    # Match any header starting with '1.' or containing key phrases
+    "part1": [r"^1\.", r"notice about the behavior", r"body structures"],
+    # Match headers starting with '2.' or containing 'Construct an explanation' or 'Part 2'
+    "part2": [r"^2\.", r"Construct an explanation", r"Part 2"],
+}
+
+
+def generate_response_options(
+    df: pd.DataFrame, email_col: str, name_col: str
+) -> list[str]:
+    """Generate a list of response options with status indicators.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing response data
+        email_col (str): Name of the email column
+        name_col (str): Name of the student name column
+
+    Returns:
+        list[str]: List of formatted response options with status indicators
+    """
+    if df.empty or email_col not in df.columns or name_col not in df.columns:
+        logger.warning(
+            f"Could not generate response options. Columns '{email_col}' or '{name_col}' might be missing or DataFrame is empty."
+        )
+        if not df.empty:
+            logger.debug(f"Available columns: {df.columns.tolist()}")
+        return []
+
+    options = []
+    for _, row in df.sort_values(by=[name_col, email_col]).iterrows():
+        email = row[email_col]
+        name = row.get(name_col, "Unknown Name")
+
+        # Determine status indicator
+        if row.get("finalized", False):
+            status = "🟢"  # Finalized
+        elif isinstance(row.get("ai_evaluation"), dict) and row.get("ai_evaluation"):
+            status = "🟡"  # In progress
+        else:
+            status = "⚪️"  # Not started
+
+        options.append(f"{status} {name} (`{email}`)")
+
+    return options
+
+
+def detect_and_rename(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Detects and renames sheet columns to our short internal names.
+    Uses exact, regex, fuzzy matching, and interactive fallback.
+    """
+    cols = df.columns.tolist()
+    mapping = {}
+    missing = []
+
+    # 1) Try exact, regex, then fuzzy match
+    for internal, patterns in COLUMN_PATTERNS.items():
+        match = None
+        # exact
+        for pat in patterns:
+            if pat in cols:
+                match = pat
+                break
+        # regex
+        if not match:
+            for pat in patterns:
+                rx = re.compile(pat, re.IGNORECASE)
+                for c in cols:
+                    if rx.search(c):
+                        match = c
+                        break
+                if match:
+                    break
+        # fuzzy
+        if not match:
+            cand = get_close_matches(internal, cols, n=1, cutoff=0.6)
+            if cand:
+                match = cand[0]
+        if match:
+            mapping[match] = internal
+            logger.info(f"Mapped column '{match}' to '{internal}'")
+        else:
+            missing.append(internal)
+
+    # 2) Interactive fallback
+    if missing:
+        st.sidebar.warning(
+            f"Could not auto-detect columns: {missing}\nPlease select manually."
+        )
+        for internal in missing:
+            choice = st.sidebar.selectbox(
+                f"Which column is '{internal}'?",
+                [c for c in cols if c not in mapping.keys()],
+                key=f"col_{internal}",
+            )
+            if choice:
+                mapping[choice] = internal
+                logger.info(f"Manually mapped column '{choice}' to '{internal}'")
+
+    # Apply the mapping
+    renamed_df = df.rename(columns=mapping)
+
+    # Update global column references based on mapping
+    global PART1_COL, PART2_COL
+    PART1_COL = "part1"  # Use the internal name
+    PART2_COL = "part2"  # Use the internal name
+
+    return renamed_df
+
 
 # Define the scope
 SCOPE = [
@@ -85,7 +193,7 @@ except Exception as e:
     st.error(
         """
     ⚠️ Could not load the evaluation prompt from Langchain Hub.
-    
+
     This means the AI evaluation features will not be available. Please check:
     1. Your internet connection
     2. Your Langchain Hub credentials
@@ -95,7 +203,7 @@ except Exception as e:
 
 
 def get_google_sheet():
-    """Connect to Google Sheets and return the worksheet data"""
+    """Connect to Google Sheets and return the worksheet data with normalized column names"""
     try:
         # Debug: Print credentials path
         logger.debug("Attempting to load credentials...")
@@ -128,25 +236,21 @@ def get_google_sheet():
         data = worksheet.get_all_records()
         logger.debug(f"Retrieved {len(data)} records")
 
-        # Debug raw data structure
-        if data:
-            logger.debug("First row data structure:")
-            for key, value in data[0].items():
-                logger.debug(f"  - {key}: {type(value)}")
-
-        # Convert to DataFrame and show detailed column info
+        # Convert to DataFrame
         df = pd.DataFrame(data)
 
-        # Debug DataFrame structure
-        logger.info("=== DataFrame Column Information ===")
-        logger.info(f"All columns: {df.columns.tolist()}")
-        logger.info("Column details:")
+        # Debug original columns
+        logger.info("=== Original DataFrame Columns ===")
         for col in df.columns:
-            logger.info(f"  - {col} (type: {df[col].dtype})")
-            # Show first non-null value for each column
-            first_val = df[col].dropna().iloc[0] if not df[col].isna().all() else None
-            logger.info(f"    First value: {first_val}")
-        logger.info("=================================")
+            logger.info(f"  - {col}")
+
+        # Apply our new column detection and renaming
+        df = detect_and_rename(df)
+
+        # Debug renamed columns
+        logger.info("=== Renamed DataFrame Columns ===")
+        for col in df.columns:
+            logger.info(f"  - {col}")
 
         return df
 
@@ -328,7 +432,7 @@ def save_enriched_data(
         db.close()
 
 
-def get_merged_data(raw_df):
+def get_merged_data(raw_df, email_col):
     """Merge raw Google Forms data with enriched data"""
     try:
         # Load enriched data
@@ -343,12 +447,39 @@ def get_merged_data(raw_df):
                 sample = enriched_df[col].iloc[0]
                 logger.debug(f"    Sample value: {sample} (type: {type(sample)})")
 
-        # Merge the dataframes - **Corrected Merge Keys**
+        # Check if the detected email column exists in raw_df before merging
+        if email_col not in raw_df.columns:
+            logger.error(
+                f"Detected email column '{email_col}' not found in raw data. Cannot merge."
+            )
+            # Optionally, add default enriched columns to raw_df and return
+            for col in [
+                "ai_evaluation",
+                "teacher_notes",
+                "finalized",
+                "last_modified",
+                "teacher_score",
+            ]:
+                if col not in raw_df.columns:
+                    raw_df[col] = pd.NA
+            raw_df["ai_evaluation"] = raw_df["ai_evaluation"].fillna({})
+            raw_df["teacher_notes"] = raw_df["teacher_notes"].fillna("")
+            raw_df["finalized"] = raw_df["finalized"].fillna(False).astype(bool)
+            raw_df["last_modified"] = pd.to_datetime(
+                raw_df["last_modified"].fillna(pd.NaT)
+            )
+            if "teacher_score" in raw_df.columns:
+                raw_df["teacher_score"] = pd.to_numeric(
+                    raw_df["teacher_score"], errors="coerce"
+                )
+            return raw_df
+
+        # Merge the dataframes - Use the detected email_col
         merged_df = pd.merge(
             raw_df,
             enriched_df,
-            # Use email from raw data and the key (which is email) from enriched data
-            left_on="Email Address",
+            # Use detected email from raw data and the key (which is email) from enriched data
+            left_on=email_col,  # Use detected email column
             right_on="Timestamp",  # This column in enriched_df holds the email
             how="left",
             suffixes=(
@@ -404,7 +535,25 @@ def get_merged_data(raw_df):
     except Exception as e:
         logger.error(f"Error in get_merged_data: {e}")
         logger.exception("Full traceback:")
-        return raw_df  # Return original data on error
+        # Add default enriched columns if merge fails completely
+        for col in [
+            "ai_evaluation",
+            "teacher_notes",
+            "finalized",
+            "last_modified",
+            "teacher_score",
+        ]:
+            if col not in raw_df.columns:
+                raw_df[col] = pd.NA
+        raw_df["ai_evaluation"] = raw_df["ai_evaluation"].fillna({})
+        raw_df["teacher_notes"] = raw_df["teacher_notes"].fillna("")
+        raw_df["finalized"] = raw_df["finalized"].fillna(False).astype(bool)
+        raw_df["last_modified"] = pd.to_datetime(raw_df["last_modified"].fillna(pd.NaT))
+        if "teacher_score" in raw_df.columns:
+            raw_df["teacher_score"] = pd.to_numeric(
+                raw_df["teacher_score"], errors="coerce"
+            )
+        return raw_df  # Return original data with defaults on error
 
 
 def run_evaluation(llm, evaluation_prompt, part1, part2):
@@ -434,12 +583,17 @@ def run_evaluation(llm, evaluation_prompt, part1, part2):
     return output_data
 
 
-def batch_evaluate(df, llm, evaluation_prompt, batch_size=5):
+def batch_evaluate(df, llm, evaluation_prompt, email_col, batch_size=5):
     """Simple batch evaluation using LLM's built-in batching."""
     try:
         # Get unevaluated responses based on ai_evaluation being null/empty in the DataFrame
-        # Assuming Timestamp is the unique key like email
-        timestamp_col = "Timestamp"
+        # Use the dynamically detected email_col as the unique key
+        if email_col not in df.columns:
+            logger.error(
+                f"Email column '{email_col}' not found in DataFrame for batch evaluation."
+            )
+            return df
+
         unevaluated_indices = df[
             df["ai_evaluation"].apply(lambda x: not isinstance(x, dict) or not x)
         ].index
@@ -459,7 +613,7 @@ def batch_evaluate(df, llm, evaluation_prompt, batch_size=5):
 
             for idx, row in batch.iterrows():
                 try:
-                    email = row[timestamp_col]  # Assuming Timestamp holds the email/ID
+                    email = row[email_col]  # Use detected email column
                     logger.debug(f"Evaluating response for {email}")
                     # Run evaluation
                     evaluation = run_evaluation(
@@ -486,13 +640,13 @@ def batch_evaluate(df, llm, evaluation_prompt, batch_size=5):
                         )
                         if save_success:
                             logger.info(f"Successfully saved evaluation for {email}")
-                            # Update the DataFrame in memory immediately using the unique email/timestamp
-                            df.loc[df[timestamp_col] == email, "ai_evaluation"] = [
+                            # Update the DataFrame in memory immediately using the unique email
+                            df.loc[df[email_col] == email, "ai_evaluation"] = [
                                 evaluation
-                            ]  # Use list for assignment with boolean index
-                            df.loc[df[timestamp_col] == email, "last_modified"] = (
+                            ]  # Use detected email_col  # Use list for assignment with boolean index
+                            df.loc[df[email_col] == email, "last_modified"] = (
                                 datetime.now()
-                            )
+                            )  # Use detected email_col
                             evaluation_count += 1
                         else:
                             logger.error(f"Failed to save evaluation for {email}")
@@ -500,7 +654,7 @@ def batch_evaluate(df, llm, evaluation_prompt, batch_size=5):
                 except Exception as e:
                     # Log error for the specific row and continue
                     logger.error(
-                        f"Error evaluating or saving response for {row.get(timestamp_col, 'UNKNOWN')}: {e}"
+                        f"Error evaluating or saving response for {row.get(email_col, 'UNKNOWN')}: {e}"  # Use detected email_col
                     )
                     continue
 
@@ -514,6 +668,18 @@ def batch_evaluate(df, llm, evaluation_prompt, batch_size=5):
         return df  # Return original DataFrame on outer error
 
 
+# --- Helper Function for Column Detection ---
+def find_column(df_columns, potential_names):
+    """Find the first matching column name from a list of potential names."""
+    for name in potential_names:
+        if name in df_columns:
+            logger.info(f"Detected column: '{name}'")
+            return name
+    logger.warning(f"Could not find any of the potential columns: {potential_names}")
+    return None
+
+
+# --- Streamlit App ---
 st.title("✨🦔 AI Response Evaluator")
 
 # --- Session State Initialization ---
@@ -526,34 +692,16 @@ if "confirm_rerun" not in st.session_state:
 
 
 # --- Callback Functions ---
-def set_selection_state(new_response_label):
-    """Callback to update selection state only."""
-    logger.debug(f"Callback set_selection_state called with: {new_response_label}")
-    if new_response_label:
-        st.session_state.selected_response = new_response_label
-    else:
-        # Clear selection state if None is passed
-        if "selected_response" in st.session_state:
-            del st.session_state["selected_response"]
+def set_selection_state(target=None):
+    """Callback to update selection state. Gets value directly from session state."""
+    logger.debug(
+        f"Callback set_selection_state called with value from selectbox: {st.session_state.response_selector}"
+    )
+    if target is not None:
+        st.session_state.response_selector = target
+    st.session_state.selected_response = st.session_state.response_selector
     # Reset confirmation state on any navigation/selection change
     st.session_state.confirm_rerun = False
-
-
-def sync_query_param():
-    """Callback to sync query param FROM session state."""
-    logger.debug("Callback sync_query_param called.")
-    if "selected_response" in st.session_state:
-        new_val = st.session_state.selected_response
-        if st.query_params.get("response") != new_val:
-            logger.debug(f"Syncing QP to: {new_val}")
-            st.query_params["response"] = new_val
-    else:
-        # If selection state is cleared, clear query param
-        query_params = st.query_params.to_dict()
-        if "response" in query_params:
-            logger.debug("Syncing QP: Clearing response param.")
-            del query_params["response"]
-            st.query_params.from_dict(query_params)
 
 
 def save_and_finalize(email, ai_eval_data, notes, score):
@@ -575,21 +723,34 @@ def save_and_finalize(email, ai_eval_data, notes, score):
         return False  # Indicate failure
 
 
-# Initialize query params and sync session state if needed (Revised)
-current_response_qp = st.query_params.get("response", None)
-# On initial load or refresh, if QP exists but state doesn't, sync state FROM QP
-if "selected_response" not in st.session_state and current_response_qp:
-    logger.debug(f"Initial load: Setting session state from QP: {current_response_qp}")
-    st.session_state.selected_response = current_response_qp
-# If state exists but QP doesn't (e.g. browser back button cleared QP), sync QP FROM state
-elif "selected_response" in st.session_state and not current_response_qp:
-    logger.debug("QP missing: Setting QP from session state.")
-    st.query_params["response"] = st.session_state.selected_response
-# We no longer force state = qp if they differ during a run,
-# as on_change callback handles user interaction driving the state.
+def clear_teacher_evaluation():
+    """Callback to clear teacher score and notes."""
+    # Get current email from selected response
+    if st.session_state.selected_response:
+        try:
+            email = st.session_state.selected_response.split("`")[
+                1
+            ]  # Extract email from format
+            # Clear the specific fields in session state
+            st.session_state[f"teacher_score_{email}"] = None
+            st.session_state[f"teacher_notes_{email}"] = ""
+            # Save the cleared state to database
+            save_enriched_data(
+                email=email,
+                ai_output=st.session_state.get(
+                    "prev_eval"
+                ),  # Keep existing AI evaluation
+                teacher_notes="",
+                teacher_score=None,
+                finalized=False,  # Unfinalize when clearing
+            )
+            st.rerun()
+        except Exception as e:
+            logger.error(f"Error clearing teacher score: {e}")
+
 
 # Use the value from session state as the source of truth during the run
-current_response = st.session_state.get("selected_response", None)
+# current_response = st.session_state.get("selected_response", None) # Determined later after sync
 
 # --- Initialize LLM (only if prompt loaded) ---
 llm = None
@@ -606,6 +767,9 @@ try:
 except Exception as e:
     st.error(f"Failed to initialize AzureChatOpenAI model: {e}")
     logger.error(f"Failed to initialize AzureChatOpenAI model: {e}")
+    # Optionally stop if LLM is crucial
+    # st.stop()
+
 
 # Add debug expander
 if logger.getEffectiveLevel() <= logging.DEBUG:
@@ -622,24 +786,60 @@ if logger.getEffectiveLevel() <= logging.DEBUG:
 df_raw = get_google_sheet()
 
 if df_raw is not None:
-    # --- Rename long column name (Option 2) ---
-    NEW_PART2_NAME = "Part 2 Explanation"  # Define the new shorter name
-    if PART2_COL in df_raw.columns:
-        df_raw.rename(columns={PART2_COL: NEW_PART2_NAME}, inplace=True)
-        logger.info(f'Renamed column "{PART2_COL[:30]}..." to "{NEW_PART2_NAME}"')
-        PART2_COL = (
-            NEW_PART2_NAME  # Re-add this line: Update constant for subsequent use
+    # --- Dynamic Column Detection ---
+    email_col = "email"  # Use internal names
+    name_col = "name"
+    teacher_col = "teacher"
+    hour_col = "hour"
+
+    # Check if essential columns were found
+    if not email_col or not name_col:
+        st.error(
+            "Could not automatically detect required 'Email' or 'Student Name' columns. Please check the Google Sheet column headers and the `COLUMN_PATTERNS` dictionary in the script."
         )
-    else:
-        logger.warning(f'Column "{PART2_COL[:30]}..." not found for renaming.')
-    # --- End Renaming ---
+        st.stop()  # Stop execution if essential columns are missing
 
     if df_raw.empty:
         logger.warning("No responses found!")
     else:
-        # Merge with enriched data
-        df = get_merged_data(df_raw)
+        # Merge with enriched data - pass detected email_col
+        df = get_merged_data(df_raw, email_col)
         logger.info(f"Loaded {len(df)} responses successfully!")
+
+        # --- State Synchronization (Session State & Query Params) ---
+        # 1. Get potential values from session state and query params
+        state_response = st.session_state.get("selected_response", None)
+        qp_response = st.query_params.get("response", None)
+
+        # 2. Generate response options first so we can validate against them
+        response_options = generate_response_options(df, email_col, name_col)
+
+        # 3. Validate current selection against available options
+        current_response = None
+        if state_response and state_response in response_options:
+            current_response = state_response
+        elif qp_response and qp_response in response_options:
+            current_response = qp_response
+            st.session_state.selected_response = (
+                current_response  # Update session state
+            )
+
+        # 4. Clear invalid selections
+        if state_response and state_response not in response_options:
+            logger.warning(
+                f"Selected response '{state_response}' not found in current filtered options. Clearing selection."
+            )
+            if "selected_response" in st.session_state:
+                del st.session_state["selected_response"]
+
+        if qp_response and qp_response != current_response:
+            logger.debug(
+                "Clearing query param because it doesn't match current selection"
+            )
+            st.query_params.clear()
+
+        # Now `current_response` holds the definitive selected response for this run
+        logger.debug(f"Final current_response for this run: {current_response}")
 
         # Show success message
         st.sidebar.success(f"📝 {len(df)} responses loaded from Google Forms")
@@ -660,35 +860,21 @@ if df_raw is not None:
         # Filtering section
         st.sidebar.header("Filter Responses")
 
-        # Try different possible column names for teacher
-        teacher_col = next(
-            (
-                col
-                for col in ["Teacher Name", "Teacher", "teacher_name", "teacher"]
-                if col in df.columns
-            ),
-            None,
-        )
+        # Use detected column names here
+        selected_teacher = "All"
         if teacher_col:
             teachers = ["All"] + sorted(df[teacher_col].unique().tolist())
             selected_teacher = st.sidebar.selectbox("Teacher:", teachers)
         else:
-            selected_teacher = "All"
+            logger.info("Teacher column not detected, filter disabled.")
 
-        # Try different possible column names for hour
-        hour_col = next(
-            (
-                col
-                for col in ["Hour", "Period", "Class Period", "hour"]
-                if col in df.columns
-            ),
-            None,
-        )
+        # Use detected column names here
+        selected_hour = "All"
         if hour_col:
             hours = ["All"] + sorted(df[hour_col].unique().tolist())
             selected_hour = st.sidebar.selectbox("Hour:", hours)
         else:
-            selected_hour = "All"
+            logger.info("Hour column not detected, filter disabled.")
 
         # Add status filter
         status_options = ["All", "Not Started", "In Progress", "Finalized"]
@@ -702,10 +888,21 @@ if df_raw is not None:
             filtered_df = filtered_df[filtered_df[hour_col] == selected_hour]
         if selected_status != "All":
             if selected_status == "Not Started":
-                filtered_df = filtered_df[filtered_df["ai_evaluation"].isna()]
-            elif selected_status == "In Progress":
+                # More robust check for "Not Started" (handles None, NaN, empty dicts)
                 filtered_df = filtered_df[
-                    (filtered_df["ai_evaluation"].notna())
+                    filtered_df["ai_evaluation"].apply(
+                        lambda x: not isinstance(x, dict) or not x
+                    )
+                    & (
+                        ~filtered_df["finalized"].fillna(False)
+                    )  # Ensure not finalized either
+                ]
+            elif selected_status == "In Progress":
+                # Check for non-empty dict in ai_evaluation AND not finalized
+                filtered_df = filtered_df[
+                    filtered_df["ai_evaluation"].apply(
+                        lambda x: isinstance(x, dict) and bool(x)
+                    )
                     & (~filtered_df["finalized"].fillna(False))
                 ]
             elif selected_status == "Finalized":
@@ -750,28 +947,123 @@ if df_raw is not None:
         """
         )
 
+        # Find the index of the current selection in the options list
+        current_selection_index = None
+        if current_response and response_options:
+            try:
+                current_selection_index = response_options.index(current_response)
+            except ValueError:
+                logger.warning(
+                    f"Current response '{current_response}' not found in options list. This should not happen due to earlier validation."
+                )
+                current_selection_index = None
+
+        # Add the radio list to choose a response
+        st.sidebar.radio(
+            "Select Response:",
+            options=response_options,
+            index=current_selection_index if current_selection_index is not None else 0,
+            on_change=set_selection_state,  # Use the callback
+            key="response_selector",  # Use a STATIC key
+            label_visibility="collapsed",  # Hide label if desired
+        )
+
+        # Add Start Review button
+        if (
+            response_options and not current_response
+        ):  # Only show when no response is selected
+            first_response = response_options[0] if response_options else None
+            if first_response:
+                st.sidebar.button(
+                    "✨ Start Review",
+                    type="primary",
+                    on_click=set_selection_state,
+                    kwargs={"target": first_response},
+                    use_container_width=True,
+                )
+
+        # Add batch evaluation callback
+        def run_batch_evaluation():
+            """Callback to run batch evaluation and ensure UI updates."""
+            if not llm or not evaluation_prompt:
+                st.error("AI evaluation is not available.")
+                return
+
+            # Get filtered unevaluated count
+            filtered_not_started = int(st.session_state.get("filtered_not_started", 0))
+
+            try:
+                # Get the current filtered DataFrame from session state
+                df = st.session_state.get("df", None)
+                if df is None:
+                    st.error("No data available for evaluation.")
+                    return
+
+                # Run batch evaluation
+                df_updated = batch_evaluate(df, llm, evaluation_prompt, email_col)
+
+                # Update session state with new DataFrame
+                st.session_state.df = df_updated
+                # Set a flag to indicate evaluation is complete
+                st.session_state.batch_eval_complete = True
+
+            except Exception as e:
+                st.error(f"Error during batch evaluation: {str(e)}")
+                logger.error(f"Batch evaluation error: {str(e)}")
+
         # Add batch evaluation button if there are unevaluated responses
         # Use the new filtered_not_started count
-        # filtered_unevaluated = len(filtered_df[filtered_df["ai_evaluation"].isna()])
+        if filtered_not_started > 0 and llm and evaluation_prompt:
+            # Store the count in session state for the callback
+            st.session_state.filtered_not_started = filtered_not_started
+
+            st.sidebar.button(
+                f"🤖 Evaluate {filtered_not_started} Responses",
+                type="secondary",
+                on_click=run_batch_evaluation,
+                use_container_width=True,
+            )
+
+            # Check if batch evaluation just completed
+            if st.session_state.get("batch_eval_complete", False):
+                st.success("Batch evaluation completed!")
+                # Clear the flag
+                st.session_state.batch_eval_complete = False
+                # Rerun here in the main flow
+                st.rerun()
 
         # Main content area
         # Show response details only if a response is selected AND initial load is complete
-        if selected_response_label and st.session_state.get(
-            "initial_load_complete", False
-        ):
+        if current_response and st.session_state.get("initial_load_complete", False):
             try:
                 # Extract email from the selected label (split by backtick)
                 # Example format: "🟢 Student Name (`student@example.com`)"
-                parts = selected_response_label.split("`")
+                parts = current_response.split("`")
                 if len(parts) >= 2:
                     selected_email = parts[-2]
                 else:
                     raise ValueError("Could not parse email from selection label")
 
-                selected_row = filtered_df[
-                    filtered_df[email_col] == selected_email
-                ].iloc[0]
-                current_idx = response_options.index(selected_response_label)
+                # Find the selected row in the *filtered* DataFrame
+                selected_rows = filtered_df[filtered_df[email_col] == selected_email]
+
+                if selected_rows.empty:
+                    # Handle case where selected response is no longer in filtered list
+                    logger.warning(
+                        f"Selected response {selected_email} not found in *filtered* data. Clearing selection."
+                    )
+                    st.warning(
+                        "The previously selected response is no longer visible with the current filters. Please select another response."
+                    )
+                    if "selected_response" in st.session_state:
+                        del st.session_state["selected_response"]
+                    current_response = None
+                    st.query_params.clear()
+                    st.rerun()
+
+                selected_row = selected_rows.iloc[0]
+                # Find index in the potentially filtered response_options list
+                current_idx = response_options.index(current_response)
 
                 # Status indicator
                 status_col1, status_col2 = st.columns([3, 1])
@@ -781,10 +1073,14 @@ if df_raw is not None:
                         and selected_row["finalized"]
                     ):
                         st.success("✅ Review Complete")
-                    elif pd.notna(selected_row.get("ai_evaluation")):
-                        st.warning("🔄 Review In Progress")
+                    elif (
+                        pd.notna(selected_row.get("ai_evaluation"))
+                        and isinstance(selected_row.get("ai_evaluation"), dict)
+                        and selected_row.get("ai_evaluation")
+                    ):
+                        st.warning("🟡 Review In Progress")
                     else:
-                        st.info("🆕 Not Yet Evaluated")
+                        st.info("⚪️ Not Yet Evaluated")
                 with status_col2:
                     if pd.notna(selected_row.get("last_modified")):
                         st.caption(
@@ -795,15 +1091,32 @@ if df_raw is not None:
                 with st.expander("📝 Student Information", expanded=False):
                     info_col1, info_col2, info_col3 = st.columns([2, 1, 1])
                     with info_col1:
-                        st.markdown(f"**Name:** {selected_row[name_col]}")
-                        st.markdown(f"**Email:** {selected_row[email_col]}")
+                        # Use detected column names
+                        st.markdown(f"**Name:** {selected_row.get(name_col, 'N/A')}")
+                        st.markdown(f"**Email:** {selected_row.get(email_col, 'N/A')}")
                     with info_col2:
-                        st.markdown(f"**Teacher:** {selected_row['Teacher Name']}")
+                        # Use detected teacher column if available
+                        if teacher_col:
+                            st.markdown(
+                                f"**Teacher:** {selected_row.get(teacher_col, 'N/A')}"
+                            )
+                        else:
+                            st.markdown("**Teacher:** (Not Detected)")
                     with info_col3:
-                        st.markdown(f"**Hour:** {selected_row['Hour']}")
+                        # Use detected hour column if available
+                        if hour_col:
+                            st.markdown(
+                                f"**Hour:** {selected_row.get(hour_col, 'N/A')}"
+                            )
+                        else:
+                            st.markdown("**Hour:** (Not Detected)")
 
                 # Response content in expander
-                has_evaluation = pd.notna(selected_row.get("ai_evaluation"))
+                has_evaluation = (
+                    pd.notna(selected_row.get("ai_evaluation"))
+                    and isinstance(selected_row.get("ai_evaluation"), dict)
+                    and selected_row.get("ai_evaluation")
+                )
                 prev_eval = None  # Initialize prev_eval here
                 with st.expander("📝 Student Response", expanded=not has_evaluation):
                     # Only show Part 1 if it exists
@@ -819,15 +1132,15 @@ if df_raw is not None:
                             key="part1_display",
                         )
 
-                st.markdown("**Part 2:**")
-                st.text_area(
-                    "Part 2",
-                    selected_row.get(PART2_COL, ""),
-                    height=150,
-                    disabled=True,
-                    label_visibility="collapsed",
-                    key="part2_display",
-                )
+                    st.markdown("**Part 2:**")
+                    st.text_area(
+                        "Part 2",
+                        selected_row.get(PART2_COL, ""),
+                        height=150,
+                        disabled=True,
+                        label_visibility="collapsed",
+                        key="part2_display",
+                    )
 
                 # Show existing evaluation if available
                 if has_evaluation:
@@ -840,63 +1153,94 @@ if df_raw is not None:
                             isinstance(evaluation_data, str) and evaluation_data.strip()
                         ):
                             # Fallback: try parsing if it's somehow still a string
+                            logger.warning(
+                                f"AI evaluation for {selected_email} was a string, attempting parse."
+                            )
                             prev_eval = json.loads(evaluation_data)
                         else:
+                            # This case should be less likely now with the improved has_evaluation check
                             logger.warning(
-                                f"AI evaluation data for {selected_email} is not a valid dict or JSON string: {evaluation_data}"
+                                f"AI evaluation data for {selected_email} is not a valid dict: {evaluation_data}"
                             )
                             st.warning(
                                 "Could not display previous AI evaluation data (invalid format)."
                             )
 
                         # Check if prev_eval was successfully assigned
-                        if prev_eval:
+                        if prev_eval and isinstance(
+                            prev_eval, dict
+                        ):  # Ensure prev_eval is a dict
                             st.markdown("### 🤖 AI Evaluation")
 
                             # Show annotated response first
+                            # Provide default empty string if key is missing
                             with st.expander("📝 Annotated Response", expanded=True):
-                                st.markdown(prev_eval.get("annotated_response", ""))
+                                st.markdown(
+                                    prev_eval.get(
+                                        "annotated_response",
+                                        "*Annotation not found in evaluation data.*",
+                                    )
+                                )
 
                             # Show feedback
+                            # Provide default empty dict/string if keys are missing
                             with st.expander("💭 Feedback", expanded=True):
                                 feedback_data = prev_eval.get("feedback", {})
                                 st.markdown("**Strengths:**")
-                                st.markdown(feedback_data.get("strengths", ""))
+                                st.markdown(
+                                    feedback_data.get(
+                                        "strengths", "*Strengths not found.*"
+                                    )
+                                )
                                 st.markdown("**Suggestions:**")
-                                st.markdown(feedback_data.get("suggestions", ""))
-                        else:
-                            # Handle case where prev_eval couldn't be loaded/parsed
-                            if (
-                                not isinstance(evaluation_data, dict)
-                                and evaluation_data
-                            ):
-                                st.error(
-                                    "Could not load previous evaluation data (invalid format)."
+                                st.markdown(
+                                    feedback_data.get(
+                                        "suggestions", "*Suggestions not found.*"
+                                    )
                                 )
 
+                        else:
+                            # This condition means has_evaluation was true, but prev_eval didn't become a dict
+                            logger.error(
+                                f"Evaluation data existed for {selected_email} but failed to load as dict: {evaluation_data}"
+                            )
+                            st.error(
+                                "Could not load previous evaluation data despite it being present."
+                            )
+
+                    except json.JSONDecodeError as e:
+                        st.error(
+                            f"Could not parse previous evaluation data (JSON error): {e}"
+                        )
+                        logger.error(
+                            f"Error parsing evaluation JSON for {selected_email}: {e}"
+                        )
                     except Exception as e:
-                        st.error("Could not load previous evaluation data")
-                        logger.error(f"Error loading evaluation data: {e}")
+                        st.error(f"Could not load previous evaluation data: {e}")
+                        logger.error(
+                            f"Error loading evaluation data for {selected_email}: {e}"
+                        )
 
                 # Display AI scores just before teacher evaluation
                 # Check if prev_eval is a valid dictionary before proceeding
                 if prev_eval and isinstance(prev_eval, dict):
                     try:
+                        # Provide default empty dict if key is missing
                         scores = prev_eval.get("rubric_scores", {})
 
                         # Custom CSS for score section
                         st.markdown(
                             """
                             <style>
-                                .score-label { 
-                                    color: #555; 
-                                    font-size: 0.9rem; 
-                                    font-weight: 600; 
-                                    margin-bottom: 0.2rem; 
+                                .score-label {
+                                    color: #555;
+                                    font-size: 0.9rem;
+                                    font-weight: 600;
+                                    margin-bottom: 0.2rem;
                                 }
-                                .score-value { 
-                                    font-size: 1.8rem; 
-                                    font-weight: 700; 
+                                .score-value {
+                                    font-size: 1.8rem;
+                                    font-weight: 700;
                                     color: #0F52BA;
                                     margin: 0;
                                     line-height: 1;
@@ -932,15 +1276,18 @@ if df_raw is not None:
                                         '<p class="score-label">SEP</p>',
                                         unsafe_allow_html=True,
                                     )
+                                    # Provide default 0 if key missing
                                     st.markdown(
                                         f'<p class="score-value">{scores.get("SEP", 0)}<span class="score-denominator">/4</span></p>',
                                         unsafe_allow_html=True,
                                     )
+
                                 with row1_cols[1]:
                                     st.markdown(
                                         '<p class="score-label">DCI</p>',
                                         unsafe_allow_html=True,
                                     )
+                                    # Provide default 0 if key missing
                                     st.markdown(
                                         f'<p class="score-value">{scores.get("DCI", 0)}<span class="score-denominator">/4</span></p>',
                                         unsafe_allow_html=True,
@@ -952,15 +1299,18 @@ if df_raw is not None:
                                         '<p class="score-label">CCC</p>',
                                         unsafe_allow_html=True,
                                     )
+                                    # Provide default 0 if key missing
                                     st.markdown(
                                         f'<p class="score-value">{scores.get("CCC", 0)}<span class="score-denominator">/4</span></p>',
                                         unsafe_allow_html=True,
                                     )
+
                                 with row2_cols[1]:
                                     st.markdown(
                                         '<p class="score-label">Communication</p>',
                                         unsafe_allow_html=True,
                                     )
+                                    # Provide default 0 if key missing
                                     st.markdown(
                                         f'<p class="score-value">{scores.get("Communication", 0)}<span class="score-denominator">/4</span></p>',
                                         unsafe_allow_html=True,
@@ -972,17 +1322,69 @@ if df_raw is not None:
                                     '<p class="score-label">✨Overall</p>',
                                     unsafe_allow_html=True,
                                 )
+                                # Provide default 0 if key missing
                                 st.markdown(
                                     f'<p class="score-value overall-score">{scores.get("Overall", 0)}<span class="score-denominator">/4</span></p>',
                                     unsafe_allow_html=True,
                                 )
 
+                            # Add rerun button below scores
+                            rerun_button = False  # Initialize
+                            if llm and evaluation_prompt:
+                                button_label = (
+                                    "🔄:hedgehog: Rerun Evaluation"
+                                    if has_evaluation
+                                    else "🤖 Evaluate with AI"
+                                )
+                                rerun_button_clicked = (
+                                    st.button(  # Use different variable name
+                                        button_label,
+                                        type="secondary",
+                                        use_container_width=True,
+                                        key="eval_rerun_button",  # Keep key simple
+                                    )
+                                )
+                                # Add confirmation only for rerun
+                                if rerun_button_clicked and has_evaluation:
+                                    if not st.session_state.get("confirm_rerun", False):
+                                        st.session_state.confirm_rerun = True
+                                        st.rerun()  # Rerun to show checkbox
+
+                                    if st.session_state.get("confirm_rerun", False):
+                                        confirm_key = f"rerun_confirm_{selected_email}"  # Unique key
+                                        if st.checkbox(
+                                            "✓ Confirm AI rerun", key=confirm_key
+                                        ):
+                                            st.session_state.confirm_rerun = (
+                                                False  # Reset on confirm
+                                            )
+                                            rerun_button = True  # Set flag to proceed
+                                        else:
+                                            rerun_button = False  # Checkbox not ticked
+                                            # Keep confirm_rerun = True until checkbox is ticked or user navigates away
+                                    # No confirmation needed if it's the first evaluation
+                                elif rerun_button_clicked and not has_evaluation:
+                                    st.session_state.confirm_rerun = (
+                                        False  # Reset just in case
+                                    )
+                                    rerun_button = True  # Set flag to proceed
+
                     except Exception as e:
                         st.error("Could not display AI scores")
-                        logger.error(f"Error displaying AI scores: {e}")
+                        logger.error(
+                            f"Error displaying AI scores for {selected_email}: {e}"
+                        )
 
                 # Teacher evaluation section
-                st.markdown("### 👩‍🏫 Teacher Evaluation")
+                st.markdown("### 👩‍🏫 Teacher Score")
+
+                # Add clear button above the evaluation fields
+                if st.button(
+                    "🗑️ Clear Score and Notes",
+                    type="secondary",
+                    help="Clear teacher score and notes",
+                ):
+                    clear_teacher_evaluation()
 
                 # Create two columns for score and notes
                 score_col, notes_col = st.columns([1, 3])
@@ -995,18 +1397,26 @@ if df_raw is not None:
                         int(float(current_score)) if pd.notna(current_score) else None
                     )
                     # Create list of scores in descending order
-                    score_options = [4, 3, 2, 1]
+                    score_options_list = [4, 3, 2, 1]  # Renamed variable
+                    score_index = None
+                    if default_score is not None:
+                        try:
+                            score_index = score_options_list.index(default_score)
+                        except ValueError:
+                            logger.warning(
+                                f"Saved teacher score {default_score} not in options {score_options_list}. Resetting."
+                            )
+                            default_score = None  # Reset if value isn't in options
+
                     teacher_score = st.radio(
                         "Score",
-                        options=score_options,
-                        index=(
-                            None
-                            if default_score is None
-                            else score_options.index(default_score)
-                        ),
-                        help="Select score from 4-0",
+                        options=score_options_list,
+                        index=score_index,
+                        help="Select score from 4-1",
                         label_visibility="collapsed",
+                        key=f"teacher_score_{selected_email}",  # Unique key per response
                     )
+
                     if teacher_score is None:
                         st.caption("⚠️ Select a score")
                     else:
@@ -1021,13 +1431,13 @@ if df_raw is not None:
                         value=current_notes,
                         height=100,
                         placeholder="Add your evaluation notes, observations, or feedback...",
-                        key="teacher_notes",
+                        key=f"teacher_notes_{selected_email}",  # Unique key per response
                     )
                     st.caption(f"{len(teacher_notes)}/500 characters")
 
                 # Navigation controls at bottom
                 st.divider()
-                nav_cols = st.columns(4)
+                nav_cols = st.columns(2)
 
                 # Back button
                 if current_idx > 0:
@@ -1035,115 +1445,29 @@ if df_raw is not None:
                     nav_cols[0].button(
                         "← Back",
                         use_container_width=True,
-                        on_click=set_selection_state,  # Use callback
-                        args=(back_target,),  # Pass target label
+                        on_click=set_selection_state,
+                        kwargs={"target": back_target},  # Pass as kwargs
                     )
-                    # Remove direct state/QP update and rerun from here
 
-                # Evaluate/Rerun button
-                rerun_button = False  # Initialize
-                if llm and evaluation_prompt:
-                    has_eval = pd.notna(selected_row.get("ai_evaluation"))
-                    button_label = "🔄 Rerun" if has_eval else "🤖 Evaluate"
-                    rerun_button = nav_cols[1].button(
-                        button_label,
-                        type="secondary",
-                        use_container_width=True,
-                        key="eval_rerun_button",
-                    )
-                    # Add confirmation only for rerun
-                    if rerun_button and has_eval:
-                        if not st.session_state.get("confirm_rerun", False):
-                            st.session_state.confirm_rerun = True
-                            rerun_button = False  # Don't proceed yet
-                            st.rerun()  # Rerun to show checkbox
-
-                        if st.session_state.get("confirm_rerun", False):
-                            if nav_cols[1].checkbox(
-                                "✓ Confirm rerun", key="rerun_confirm_box"
-                            ):
-                                st.session_state.confirm_rerun = (
-                                    False  # Reset on confirm
-                                )
-                                # Let rerun_button remain True
-                            else:
-                                rerun_button = False  # Checkbox not ticked
-                        elif rerun_button and not has_eval:
-                            st.session_state.confirm_rerun = (
-                                False  # Reset if Evaluate is clicked
-                            )
-
-                # Skip button
+                # Next button
                 if current_idx < len(response_options) - 1:
-                    skip_target = response_options[current_idx + 1]
-                    nav_cols[2].button(
-                        "Skip →",
+                    next_target = response_options[current_idx + 1]
+                    nav_cols[1].button(
+                        "Next →",
                         use_container_width=True,
-                        on_click=set_selection_state,  # Use callback
-                        args=(skip_target,),  # Pass target label
+                        on_click=set_selection_state,
+                        kwargs={"target": next_target},  # Pass as kwargs
                     )
-                    # Remove direct state/QP update and rerun from here
 
-                # Done button
-                # Enable Done button only if teacher_score is selected
-                done_disabled = teacher_score is None
-                done_help = (
-                    "Select a teacher score before marking as Done."
-                    if done_disabled
-                    else None
-                )
-                # Ensure ai_eval_data is defined before being passed to callback args
-                ai_eval_data = None
-                current_ai_eval = selected_row.get("ai_evaluation")
-                if pd.notna(current_ai_eval):
-                    if isinstance(current_ai_eval, dict):
-                        ai_eval_data = current_ai_eval  # It's already a dict
-                    elif isinstance(current_ai_eval, str) and current_ai_eval.strip():
-                        try:
-                            ai_eval_data = json.loads(current_ai_eval)
-                        except (json.JSONDecodeError, TypeError):
-                            logger.warning(
-                                f"Could not parse existing ai_evaluation string for {selected_email} when setting up Done button args: {current_ai_eval}"
-                            )
-                            ai_eval_data = (
-                                current_ai_eval  # Pass raw string if parsing fails
-                            )
-                    else:
-                        # Handle other non-dict, non-string types if necessary, or just pass None
-                        logger.warning(
-                            f"Unexpected type for ai_evaluation for {selected_email}: {type(current_ai_eval)}"
-                        )
-                        ai_eval_data = None
-
-                # Done Button - Now define it *after* ai_eval_data is set
-                if nav_cols[3].button(
-                    "Done ✨",
-                    type="primary",
-                    use_container_width=True,
-                    disabled=done_disabled,
-                    help=done_help,
-                    on_click=save_and_finalize,  # Use callback
-                    args=(  # Pass necessary args to callback
-                        selected_email,
-                        ai_eval_data,
-                        teacher_notes,
-                        teacher_score,
-                    ),
-                ):
-                    # This block now executes *after* the callback runs (due to rerun)
-                    # We need to check if finalization was successful to navigate.
-                    # The navigation logic needs to be separate or triggered by the callback's effect.
-                    pass
-
-                # Run evaluation if requested
+                # Run evaluation if requested (check rerun_button flag)
                 if llm and evaluation_prompt and rerun_button:
-                    with st.spinner("Running evaluation..."):
+                    with st.spinner("Running AI evaluation..."):
                         try:
                             st.session_state.confirm_rerun = (
                                 False  # Reset confirm after trigger
                             )
                             logger.info(
-                                f"Starting evaluation/rerun process for {selected_email}"
+                                f"Starting AI evaluation/rerun process for {selected_email}"
                             )
                             evaluation = run_evaluation(
                                 llm,
@@ -1152,11 +1476,13 @@ if df_raw is not None:
                                 selected_row.get(PART2_COL, ""),
                             )
                             logger.debug(
-                                f"Evaluation result for {selected_email}: {evaluation}"
+                                f"AI evaluation result for {selected_email}: {evaluation}"
                             )
 
                             # Save the evaluation result
-                            if evaluation:
+                            if evaluation and isinstance(
+                                evaluation, dict
+                            ):  # Ensure valid result
                                 # Use the current teacher score and notes if available
                                 save_success = save_enriched_data(
                                     selected_email,
@@ -1168,29 +1494,57 @@ if df_raw is not None:
                                     ),  # Keep existing finalized status
                                 )
                                 if save_success:
-                                    st.success("Evaluation saved successfully!")
+                                    st.success("AI evaluation saved successfully!")
+                                    # Update prev_eval in the current run so UI updates immediately if needed
+                                    prev_eval = evaluation
                                     st.rerun()
                                 else:
-                                    st.error("Failed to save evaluation")
+                                    st.error("Failed to save AI evaluation")
                             else:
-                                st.error("Evaluation returned no results")
+                                st.error("AI evaluation returned no valid results")
 
                         except Exception as e:
-                            st.error(f"Error running evaluation: {str(e)}")
-                            logger.error(f"Evaluation error: {str(e)}")
+                            st.error(f"Error running AI evaluation: {str(e)}")
+                            logger.error(
+                                f"AI evaluation error for {selected_email}: {str(e)}"
+                            )
                             logger.error(
                                 f"Selected row columns: {selected_row.index.tolist()}"
                             )
 
             except (IndexError, ValueError) as e:
-                st.error(
-                    "Could not find the selected response. Ensure emails are unique."
-                )
-                logger.error(f"Error loading response: {e}")
+                # Check if the error is specifically because the index wasn't found
+                if isinstance(e, ValueError) and "is not in list" in str(e):
+                    logger.warning(
+                        f"Selected response '{current_response}' is not in the current 'response_options' list (likely due to filtering). Clearing selection."
+                    )
+                    st.warning(
+                        "The previously selected response is no longer visible with the current filters. Please select another response."
+                    )
+                elif isinstance(e, IndexError):
+                    logger.error(
+                        f"IndexError accessing filtered_df for {selected_email}. Filtered list might be empty unexpectedly. {e}"
+                    )
+                    st.error(
+                        "An internal error occurred trying to access the selected response data."
+                    )
+                else:  # Handle other potential ValueErrors like parsing
+                    st.error(
+                        f"Could not find or parse the selected response '{current_response}'. It might be invalid. Please select another response."
+                    )
+                    logger.error(f"Error loading selected response: {e}")
+
+                # Clear invalid selection state regardless of specific error type
+                if "selected_response" in st.session_state:
+                    del st.session_state["selected_response"]
+                current_response = None  # Clear local var
+                st.query_params.clear()
+                st.rerun()
+
         else:
             # Welcome/instruction state (shows on initial load or if no response selected)
             st.info(
-                "👈 Find your students by selecting your name and class period in the sidebar"
+                "👈 Find your students by selecting your name and class period in the sidebar, then choose a response."
             )
 
             # Add helpful instructions
@@ -1201,16 +1555,16 @@ if df_raw is not None:
             All responses are loaded. Three steps to review:
 
             #### 1. Find Students
-            Select your name and class period in the sidebar
+            Select your name and class period in the sidebar, then choose a specific response.
 
             #### 2. Generate Feedback
-            Click "Evaluate" to analyze responses (⚪️ → 🟡 → 🟢)
+            Click "🤖 Evaluate with AI" to analyze a response. You can also "🔄 Rerun Evaluation" if needed. Use "🤖 Evaluate X Responses" in the sidebar for batch processing.
 
-            #### 3. Review
-            - Check AI feedback and scores
-            - Add your score (1-4) and notes (Optional)
-            - Click "Done" when finished
-            - Results are tracked and you can export the data as a CSV
+            #### 3. Review & Finalize
+            - Check AI feedback and scores.
+            - Add your score (1-4) and notes (Optional).
+            - Click "Done ✨" when finished with a response.
+            - Results are saved automatically.
 
             """
             )
@@ -1218,7 +1572,7 @@ if df_raw is not None:
             # Show progress metrics if available
             if "df" in locals() and not df.empty:
                 st.divider()
-                st.markdown("### 📊 Current Progress")
+                st.markdown("### 📊 Overall Progress")
 
                 # Calculate metrics
                 total = len(df)
@@ -1228,19 +1582,50 @@ if df_raw is not None:
                     .sum()
                 )
                 finalized = df["finalized"].fillna(False).sum()
+                in_progress = evaluated - finalized
+                not_started = total - evaluated  # Simpler calculation
 
                 # Display metrics in columns
-                col1, col2, col3 = st.columns(3)
+                col1, col2, col3, col4 = st.columns(4)
                 with col1:
                     st.metric("Total Responses", total)
                 with col2:
-                    st.metric("Evaluated", f"{evaluated} ({evaluated/total*100:.1f}%)")
+                    st.metric(
+                        "⚪️ Not Started",
+                        f"{not_started}",
+                    )
                 with col3:
-                    st.metric("Finalized", f"{finalized} ({finalized/total*100:.1f}%)")
+                    st.metric(
+                        " 🟡 AI Evaluated",
+                        f"{in_progress}",
+                    )
+
+                with col4:
+                    st.metric(
+                        " 🟢 Teacher Scored",
+                        f"{finalized}",
+                    )
 
             # Set the flag indicating the initial load process is complete
             st.session_state.initial_load_complete = True
 
+        # Update filtered metrics for session state
+        st.session_state.filtered_total = filtered_total
+        st.session_state.filtered_evaluated = filtered_evaluated
+        st.session_state.filtered_finalized = filtered_finalized
+        st.session_state.filtered_in_progress = filtered_in_progress
+        st.session_state.filtered_not_started = filtered_not_started
+
+        # Store the current DataFrame in session state
+        st.session_state.df = df
+
 else:
-    logger.error("Failed to load responses")
-    st.error("Failed to load responses")
+    logger.error("Failed to load responses from Google Sheet")
+    st.error(
+        "🔴 Failed to load responses from Google Sheet. Please check logs or credentials."
+    )
+
+
+def get_current_time() -> str:
+    """Get current time in ISO format."""
+    return datetime.now().isoformat()
