@@ -8,7 +8,6 @@ import os
 from dotenv import load_dotenv
 import logging
 import json
-import time
 from datetime import datetime
 import uuid
 from sqlalchemy import Float
@@ -1342,8 +1341,6 @@ if df_raw is not None:
                 st.error("AI evaluation is not available.")
                 return
 
-            # Get filtered unevaluated count
-            filtered_not_started = int(st.session_state.get("filtered_not_started", 0))
 
             try:
                 # Get the current filtered DataFrame from session state
