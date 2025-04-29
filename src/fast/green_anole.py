@@ -10,6 +10,8 @@ import logging
 import json
 import time
 from datetime import datetime
+import uuid
+from sqlalchemy import Float
 
 # --- SQLAlchemy Imports ---
 from sqlalchemy import create_engine, Column, String, JSON, Boolean, DateTime, Integer
@@ -236,7 +238,67 @@ class EnrichedData(Base):
     last_modified = Column(DateTime, default=datetime.now)
 
 
-# Create the table if it doesn't exist
+# Define the Feedback model for tracking teacher actions
+class Feedback(Base):
+    __tablename__ = "feedback"
+
+    # Fields from the spec
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    modified_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    session_id = Column(
+        String, index=True
+    )  # e.g. your app session or LangSmith session
+    run_id = Column(String, index=True)  # e.g. the LLM run/span ID, if available
+    key = Column(String, nullable=False)  # e.g. "teacher_score", "ai_rerun", "clear"
+    score = Column(Float, nullable=True)  # numerical score
+    value = Column(String, nullable=True)  # categorical value, if any
+    comment = Column(String, nullable=True)  # teacher's notes
+    correction = Column(JSON, nullable=True)  # any structured correction object
+    # feedback_source object flattened:
+    feedback_source_type = Column(String, nullable=False)
+    feedback_source_metadata = Column(JSON, nullable=True)
+    feedback_source_user_id = Column(String, nullable=False)
+
+
+def log_feedback(
+    session_id: str,
+    run_id: str,
+    key: str,
+    score: float | None = None,
+    value: str | None = None,
+    comment: str | None = None,
+    correction: dict | None = None,
+    source_type: str = "app",
+    source_metadata: dict | None = None,
+):
+    """Insert a feedback record per LangSmith's spec."""
+    db = SessionLocal()
+    try:
+        db.add(
+            Feedback(
+                session_id=session_id,
+                run_id=run_id,
+                key=key,
+                score=score,
+                value=value,
+                comment=comment,
+                correction=correction,
+                feedback_source_type=source_type,
+                feedback_source_metadata=source_metadata,
+                feedback_source_user_id=st.experimental_user.email,
+            )
+        )
+        db.commit()
+        logger.info(f"Successfully logged feedback: {key}")
+    except Exception as e:
+        logger.error(f"Failed to log feedback {key}: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+# Create the tables if they don't exist
 Base.metadata.create_all(bind=ENGINE)
 
 # --- Load Langchain Hub Prompt ---
@@ -914,6 +976,8 @@ if "selected_response" not in st.session_state:
     st.session_state.selected_response = None  # Initialize if not present
 if "confirm_rerun" not in st.session_state:
     st.session_state.confirm_rerun = False  # Initialize confirmation flag
+if "app_session_id" not in st.session_state:
+    st.session_state.app_session_id = str(uuid.uuid4())  # Generate unique session ID
 
 
 # --- Callback Functions ---
@@ -989,6 +1053,18 @@ def clear_teacher_evaluation(email: str):
         teacher_score=None,  # Clear score
         finalized=False,  # Unfinalize when clearing
     )
+
+    # Log feedback if save was successful
+    if save_success:
+        log_feedback(
+            session_id=st.session_state.get("app_session_id", "local"),
+            run_id=email,  # Using email as run_id
+            key="clear",
+            source_type="app",
+            source_metadata={
+                "previous_ai_eval": bool(current_ai_eval)
+            },  # Track if AI eval was preserved
+        )
 
     # --- Update DataFrame in memory ---
     if save_success and "df" in st.session_state:
@@ -1350,6 +1426,26 @@ if df_raw is not None:
             label_visibility="collapsed",  # Hide label if desired
         )
 
+        # --- Add Download Button for Filtered Data ---
+        if not df_filtered.empty:
+            # Prepare data for download (convert dicts/lists in ai_evaluation to strings if needed)
+            df_download = df_filtered.copy()
+            if "ai_evaluation" in df_download.columns:
+                df_download["ai_evaluation"] = df_download["ai_evaluation"].apply(
+                    lambda x: str(x) if isinstance(x, (dict, list)) else x
+                )
+
+            csv = df_download.to_csv(index=False).encode("utf-8")
+            st.sidebar.download_button(
+                label=f"💾 Download {filtered_total} Selected Responses (.csv)",
+                data=csv,
+                file_name=f"filtered_responses_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                key="download_filtered_responses",
+                use_container_width=True,
+            )
+        # --- End Download Button ---
+
         # Main content area
         # Show response details only if a response is selected AND initial load is complete
         if current_response and st.session_state.get("initial_load_complete", False):
@@ -1686,6 +1782,20 @@ if df_raw is not None:
                                     # Now just let the script continue to show the checkbox
 
                                 if st.session_state.get("confirm_rerun", False):
+                                    # Log the rerun attempt before proceeding
+                                    log_feedback(
+                                        session_id=st.session_state.get(
+                                            "app_session_id", "local"
+                                        ),
+                                        run_id=current_response,  # Using email as run_id
+                                        key="ai_rerun",
+                                        source_type="app",
+                                        source_metadata={
+                                            "previous_scores": prev_eval.get(
+                                                "rubric_scores", {}
+                                            ),
+                                        },
+                                    )
                                     confirm_key = f"rerun_confirm_{current_response}"  # Unique key
 
                     except Exception as e:
@@ -1832,6 +1942,22 @@ if df_raw is not None:
                                 )
                                 logger.error(
                                     f"Failed to save changes automatically for {current_email} when navigating."
+                                )
+                            else:
+                                # Log feedback after successful save
+                                log_feedback(
+                                    session_id=st.session_state.get(
+                                        "app_session_id", "local"
+                                    ),
+                                    run_id=current_email,  # Using email as run_id since we don't track LLM runs
+                                    key="teacher_score",
+                                    score=(
+                                        float(current_score)
+                                        if current_score is not None
+                                        else None
+                                    ),
+                                    comment=current_notes,
+                                    source_type="app",
                                 )
                                 # --- Still proceed to next even if save fails ---
                         else:
