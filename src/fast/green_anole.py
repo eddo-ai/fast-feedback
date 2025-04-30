@@ -258,6 +258,9 @@ class Feedback(Base):
     feedback_source_type = Column(String, nullable=False)
     feedback_source_metadata = Column(JSON, nullable=True)
     feedback_source_user_id = Column(String, nullable=False)
+    ai_evaluation = Column(
+        JSON, nullable=True
+    )  # Store the AI evaluation at the time of feedback
 
 
 def log_feedback(
@@ -268,6 +271,7 @@ def log_feedback(
     value: str | None = None,
     comment: str | None = None,
     correction: dict | None = None,
+    ai_evaluation: dict | None = None,  # Added parameter
     source_type: str = "app",
     source_metadata: dict | None = None,
 ):
@@ -283,6 +287,7 @@ def log_feedback(
                 value=value,
                 comment=comment,
                 correction=correction,
+                ai_evaluation=ai_evaluation,  # Added field
                 feedback_source_type=source_type,
                 feedback_source_metadata=source_metadata,
                 feedback_source_user_id=st.experimental_user.email,
@@ -1063,6 +1068,7 @@ def clear_teacher_evaluation(email: str):
             source_metadata={
                 "previous_ai_eval": bool(current_ai_eval)
             },  # Track if AI eval was preserved
+            ai_evaluation=current_ai_eval,  # Pass the AI evaluation
         )
 
     # --- Update DataFrame in memory ---
@@ -1341,7 +1347,6 @@ if df_raw is not None:
                 st.error("AI evaluation is not available.")
                 return
 
-
             try:
                 # Get the current filtered DataFrame from session state
                 df = st.session_state.get("df", None)
@@ -1368,7 +1373,7 @@ if df_raw is not None:
             st.session_state.filtered_not_started = filtered_not_started
 
             st.sidebar.button(
-                f"🤖 Evaluate {filtered_not_started} Responses",
+                f"🤖 Evaluate {filtered_not_started} New Responses",
                 type="secondary",
                 on_click=run_batch_evaluation,
                 use_container_width=True,
@@ -1792,6 +1797,7 @@ if df_raw is not None:
                                                 "rubric_scores", {}
                                             ),
                                         },
+                                        ai_evaluation=prev_eval,  # Pass the previous AI evaluation
                                     )
                                     confirm_key = f"rerun_confirm_{current_response}"  # Unique key
 
@@ -1955,6 +1961,9 @@ if df_raw is not None:
                                     ),
                                     comment=current_notes,
                                     source_type="app",
+                                    ai_evaluation=current_row_data.get(
+                                        "ai_evaluation"
+                                    ),  # Pass the current AI evaluation
                                 )
                                 # --- Still proceed to next even if save fails ---
                         else:

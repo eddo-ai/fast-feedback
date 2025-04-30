@@ -1,28 +1,29 @@
-FROM python:3.12-slim
+# For more information, please refer to https://aka.ms/vscode-docker-python
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
+# Set working directory to where the src module will be
 WORKDIR /app
 
+# Copy from the cache instead of linking since it's a mounted volume
+ENV UV_LINK_MODE=copy
+
+
 # Install system dependencies
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy only requirements first to leverage Docker caching
-COPY requirements.txt .
+COPY . /app
+COPY ./.streamlit ./app/.streamlit
 
-# Create a temporary requirements file without the local package reference
-RUN grep -v "file:///Users/aw/Developer/wauwatosa" requirements.txt > requirements_clean.txt
+# Install the project's dependencies using the lockfile and settings
+RUN uv sync --frozen --no-install-project --no-dev
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements_clean.txt
+# Place executables in the environment at the front of the path
+ENV PATH="/app/.venv/bin:$PATH"
 
-# Copy the rest of the application
-COPY . .
+# Reset the entrypoint, don't invoke `uv`
+ENTRYPOINT []
 
-# Install the local package
-RUN pip install -e .
-
-EXPOSE 8502
-
-CMD ["streamlit", "run", "app.py", "--server.port=8502", "--server.address=0.0.0.0"]
+# Run the streamlit app
+CMD ["streamlit", "run", "app.py"]
