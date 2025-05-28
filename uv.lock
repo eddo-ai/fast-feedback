@@ -413,7 +413,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "ipykernel" },
+    { name = "ipykernel", specifier = ">=6.29.5" },
     { name = "watchdog", specifier = ">=6.0.0" },
 ]
 

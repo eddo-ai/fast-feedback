@@ -1,4 +1,5 @@
 # Configuration
+FILE_PATH = "data/green_anole/enriched_may_6.csv"
 DISPLAY_OPTIONS = {
     "show_teacher_score": True,  # Set to False to hide teacher scores
     "show_teacher_notes": True,  # Set to False to hide teacher notes
@@ -143,8 +144,9 @@ def create_student_reports(df):
     for (teacher_name, hour), group_df in grouped:
         # Create a sanitized filename
         safe_teacher_name = re.sub(r"[^\w\s-]", "", teacher_name).strip()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_file = os.path.join(
-            output_dir, f"{safe_teacher_name}_Hour_{hour}_reports.pdf"
+            output_dir, f"{safe_teacher_name}_Hour_{hour}_reports_{timestamp}.pdf"
         )
 
         pdf = StudentReportPDF(teacher_name=teacher_name, hour=hour)
@@ -216,7 +218,7 @@ def create_student_reports(df):
 
 
 # Load the CSV file into a pandas DataFrame
-df = pd.read_csv("data/green_anole/green_anole_data.csv")
+df = pd.read_csv(FILE_PATH)
 
 # Create the reports
 create_student_reports(df)

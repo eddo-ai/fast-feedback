@@ -6,3 +6,4 @@
 data
 .credentials/credentials.json
 src/fast/enriched_data.db
+student_reports/*

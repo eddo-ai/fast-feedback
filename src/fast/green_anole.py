@@ -706,9 +706,7 @@ def get_merged_data(raw_df, email_col):
         logger.debug("Enriched data columns:")
         for col in enriched_df.columns:
             logger.debug(f"  - {col} (type: {enriched_df[col].dtype})")
-            if len(enriched_df) > 0:
-                sample = enriched_df[col].iloc[0]
-                logger.debug(f"    Sample value: {sample} (type: {type(sample)})")
+            # Do NOT log sample values!
 
         # Check if the detected email column exists in raw_df before merging
         if email_col not in raw_df.columns:
@@ -786,13 +784,6 @@ def get_merged_data(raw_df, email_col):
             )
 
         logger.info(f"Successfully merged data with {len(merged_df)} rows")
-        # --- Add Debugging ---
-        if logger.getEffectiveLevel() <= logging.DEBUG and not merged_df.empty:
-            logger.debug("Merged DataFrame Head:\n" + merged_df.head().to_string())
-            logger.debug("Sample ai_evaluation types in merged_df:")
-            for i, val in enumerate(merged_df["ai_evaluation"].head()):
-                logger.debug(f"  Row {i}: Type={type(val)}, Value={val}")
-        # --- End Debugging ---
         return merged_df
 
     except Exception as e:
@@ -1296,19 +1287,11 @@ if df_raw is not None:
         # Store in session state for consistency
         st.session_state.response_options = response_options
 
-        # --- Add Debugging ---
         if logger.getEffectiveLevel() <= logging.DEBUG:
             logger.debug(f"Filtered DataFrame Length: {len(df)}")
-            if not df.empty:
-                logger.debug("Filtered DataFrame Head:\n" + df.head().to_string())
-        # --- End Debugging ---
 
         # Progress metrics for filtered data
         st.sidebar.divider()
-
-        # Add a test write here
-        # if logger.getEffectiveLevel() <= logging.DEBUG:
-        #     st.write("DEBUG: About to process columns and set up sidebar...")
 
         # Calculate metrics for filtered data
         filtered_total = len(df_filtered)
@@ -1661,10 +1644,28 @@ if df_raw is not None:
                         use_container_width=True,
                         key="eval_button",
                     ):
+                        # DEBUG: Log input to evaluation
+                        logger.debug(
+                            f"[EVAL] Triggered for email={current_response}, part1={selected_row.get(PART1_COL, '')[:40]}, part2={selected_row.get(PART2_COL, '')[:40]}"
+                        )
                         st.session_state.confirm_rerun = False  # Reset just in case
                         rerun_button = True  # Set flag to proceed
                         # Store current selection before rerunning
                         st.session_state.selected_response = current_response
+                        # Actually run the evaluation (simulate what happens on rerun)
+                        try:
+                            eval_result = run_evaluation(
+                                llm,
+                                evaluation_prompt,
+                                selected_row.get(PART1_COL, ""),
+                                selected_row.get(PART2_COL, ""),
+                            )
+                            # DEBUG: Log output type and keys only
+                            logger.debug(
+                                f"[EVAL] Result type: {type(eval_result)}, keys: {list(eval_result.keys()) if isinstance(eval_result, dict) else 'N/A'}"
+                            )
+                        except Exception as e:
+                            logger.error(f"[EVAL] Exception during evaluation: {e}")
                 else:
                     try:
                         # Provide default empty dict if key is missing
