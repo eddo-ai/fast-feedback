@@ -8,3 +8,4 @@ data
 src/fast/enriched_data.db
 student_reports/*
 *.pyc
+__pycache__
