@@ -1,11 +1,12 @@
 import { NextResponse } from "next/server";
-import { Pool } from "pg";
-
-const pool = new Pool({
-  connectionString: process.env.POSTGRES_URL,
-});
+import { listSamples } from "@/lib/db";
 
 export async function GET() {
-  const { rows } = await pool.query('SELECT * FROM anonymised_sample');
-  return NextResponse.json(rows);
+  try {
+    const samples = await listSamples();
+    return NextResponse.json(samples);
+  } catch (e) {
+    console.error(e);
+    return new NextResponse("Failed", { status: 500 });
+  }
 }
