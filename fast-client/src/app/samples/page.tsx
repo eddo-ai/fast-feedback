@@ -13,7 +13,7 @@ export default async function Samples() {
             <p className="text-gray-500 text-xs">Anon ID: {pseudo_student_id}</p>
             <p className="text-sm line-clamp-4">{text}</p>
             <div className="flex flex-wrap gap-1">
-              {tags.map((tag) => (
+              {tags.map((tag: string) => (
                 <Badge key={tag}>{tag}</Badge>
               ))}
             </div>

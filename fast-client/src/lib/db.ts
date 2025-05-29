@@ -1,10 +1,16 @@
+import { Pool } from 'pg';
+
+const pool = new Pool({
+  connectionString: process.env.POSTGRES_URL,
+});
+
 export async function listSamples() {
-  const res = await fetch("/api/samples");
-  if (!res.ok) throw new Error("Failed to fetch");
-  return (await res.json()) as {
-    sample_id: string;
-    pseudo_student_id: string;
-    text: string;
-    tags: string[];
-  }[];
+  const { rows } = await pool.query('SELECT * FROM anonymised_sample');
+  // Map rows to match the expected shape if needed
+  return rows.map(row => ({
+    sample_id: row.sample_id,
+    pseudo_student_id: row.pseudo_student_id,
+    text: row.text || row.content_redacted?.text || '',
+    tags: row.tags || [],
+  }));
 }
