@@ -1,5 +1,6 @@
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import Link from "next/link";
 
 export default function Home() {
   return (
@@ -8,7 +9,7 @@ export default function Home() {
         <h1 className="text-2xl font-bold">Eddo Learning</h1>
         <p className="text-sm text-gray-600">Connected to your new Postgres schema.</p>
         <Button asChild>
-          <a href="/samples">View Sample Gallery</a>
+          <Link href="/samples">View Sample Gallery</Link>
         </Button>
       </CardContent>
     </Card>
