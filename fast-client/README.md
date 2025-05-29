@@ -48,3 +48,14 @@ SUPABASE_ANON_KEY=your-anon-key
 - `SUPABASE_URL` and `SUPABASE_ANON_KEY` are used if you want to connect to Supabase from the client or server. You can find these in your Supabase project dashboard under Project Settings > API.
 
 Run the development server with `pnpm dev` and open http://localhost:3000.
+
+### Using Supabase CLI
+
+If you have the [Supabase CLI](https://supabase.com/docs/guides/cli) installed, you can seed the local database with demo samples:
+
+```bash
+pnpm supabase db reset # apply migrations and run seed.sql
+./scripts/add-samples.sh # insert example samples
+```
+
+This requires the local Supabase stack to be running with `pnpm supabase start`.
