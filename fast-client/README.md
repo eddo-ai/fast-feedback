@@ -37,10 +37,14 @@ Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/bui
 
 ## Environment Variables
 
-Create a `.env.local` file at the project root with the following variable:
+Create a `.env.local` file at the project root with the following variables:
 
 ```bash
 POSTGRES_URL=postgres://user:password@localhost:5432/eddo
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_ANON_KEY=your-anon-key
 ```
+
+- `SUPABASE_URL` and `SUPABASE_ANON_KEY` are used if you want to connect to Supabase from the client or server. You can find these in your Supabase project dashboard under Project Settings > API.
 
 Run the development server with `pnpm dev` and open http://localhost:3000.
