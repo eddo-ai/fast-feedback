@@ -15,6 +15,7 @@ dependencies = [
     "rich>=13.9.4",
     "authlib>=1.5.2",
     "ipykernel>=6.29.5",
+    "psycopg2>=2.9.10",
 ]
 
 [build-system]

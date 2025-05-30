@@ -14,16 +14,18 @@ st.set_page_config(
 
 pages = [
     st.Page("src/fast/home.py", title="Home", icon="🏠"),
+    st.Page("src/fast/green_anole_public.py", title="Green Anole Assessment", icon="🦎"),
+    # st.Page("src/fast/transcribe_images.py", title="Transcribe Images", icon="✍️"),
+    st.Page("src/fast/assessment_feedback.py", title="Assessment Feedback", icon="💬"),
 ]
 
 authenticated_pages = [
-    st.Page("src/fast/green_anole.py", title="Green Anole Assessment", icon="🦎"),
-    # st.Page("src/fast/assessment_feedback.py", title="Assessment Feedback", icon="💬"),
-    st.Page("src/fast/transcribe_images.py", title="Transcribe Images", icon="✍️"),
+    # st.Page("src/fast/green_anole.py", title="Green Anole Assessment", icon="🦎"),
+    # st.Page("src/fast/transcribe_images.py", title="Transcribe Images", icon="✍️"),
 ]
 
 admin_pages = [
-    st.Page("src/fast/db_viewer.py", title="DB Viewer", icon="📊"),
+    # st.Page("src/fast/db_viewer.py", title="DB Viewer", icon="📊"),
 ]
 
 if st.experimental_user.get("is_logged_in"):

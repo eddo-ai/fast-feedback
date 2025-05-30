@@ -3,7 +3,7 @@ secrets.toml
 .venv/
 .vscode/
 .DS_Store
-data
+/data
 .credentials/credentials.json
 src/fast/enriched_data.db
 student_reports/*
